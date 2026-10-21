@@ -113,8 +113,15 @@ pub fn opcode_name_to_byte(name: &str) -> Option<u8> {
 ///
 pub fn fresh_overrides_cache(cache_canon: u8, fresh_canon: u8) -> bool {
     use parser::opcodes::LuauOpcode;
-    let fresh_is_forgloop_pair = fresh_canon == LuauOpcode::Deprecated61 as u8
-        || fresh_canon == LuauOpcode::ForGPrepINext as u8;
+    // The generic-for PREP pair, by its real names: FORGPREP_INEXT and
+    // FORGPREP_NEXT. This used to test `Deprecated61`, a placeholder that only
+    // made sense while the internal opcode table was drifted by one slot — the
+    // byte it described is FORGPREP_NEXT. Testing a placeholder meant the rule
+    // silently stopped matching the moment the table was corrected, so a
+    // structural generic-for detection could no longer displace a permissive
+    // JumpXEq guess from the cache.
+    let fresh_is_forgloop_pair = fresh_canon == LuauOpcode::ForGPrepINext as u8
+        || fresh_canon == LuauOpcode::ForGPrepNext as u8;
     if !fresh_is_forgloop_pair {
         return false;
     }
@@ -265,36 +272,36 @@ mod merge_tests {
         assert_eq!(merged.iter().filter(|&&v| v != 255).count(), 1);
     }
 
-    /// Cache seeded with JumpXEqKB (canonical 79) at 0x35 by early small scripts,
-    /// but fresh detection on Animate.lua finds the structural ForGPrepINext →
-    /// ForGLoopINext pair that lands on 0x35 with canonical 61 (Deprecated61).
-    /// Fresh must win because pair detection is structurally stronger than
-    /// JumpXEq's permissive AUX heuristic.
+    /// Cache seeded with JumpXEqKB (79) at 0x35 by early small scripts, but fresh
+    /// detection finds the structural FORGPREP_INEXT -> FORGPREP_NEXT pair that
+    /// lands the second half on 0x35 with canonical 61. Fresh must win: pair
+    /// detection is structurally stronger than JumpXEq's permissive AUX
+    /// heuristic.
     #[test]
-    fn fresh_overrides_cache_jumpxeq_to_deprecated61() {
+    fn fresh_overrides_cache_jumpxeq_to_forgprep_next() {
         let mut fresh = [255u8; 256];
-        fresh[0x35] = 61; // Deprecated61 (ForGLoopINext) — from pair detector
-        fresh[0x65] = 60; // ForGPrepINext — pair detected both
+        fresh[0x35] = 61; // FORGPREP_NEXT — from pair detector
+        fresh[0x65] = 59; // FORGPREP_INEXT — pair detected both
 
         let mut cached = [255u8; 256];
-        cached[0x35] = 79; // JumpXEqKB — wrong, from earlier small script
+        cached[0x35] = 78; // JumpXEqKB — wrong, from earlier small script
 
         let merged = merge_cache_first(&fresh, &cached);
-        assert_eq!(merged[0x35], 61, "fresh's Deprecated61 must override cache's JumpXEqKB");
-        assert_eq!(merged[0x65], 60, "fresh's ForGPrepINext must fill gap");
+        assert_eq!(merged[0x35], 61, "fresh's FORGPREP_NEXT must override cache's JumpXEqKB");
+        assert_eq!(merged[0x65], 59, "fresh's FORGPREP_INEXT must fill gap");
     }
 
-    /// Symmetric override: ForGPrepINext (canonical 60) vs JumpXEqKNil (78) at same byte.
+    /// Symmetric override: FORGPREP_INEXT (59) vs JumpXEqKNil (77) at the same byte.
     #[test]
     fn fresh_overrides_cache_jumpxeq_to_forgprep_inext() {
         let mut fresh = [255u8; 256];
-        fresh[0x40] = 60; // ForGPrepINext — from pair detector
+        fresh[0x40] = 59; // FORGPREP_INEXT — from pair detector
 
         let mut cached = [255u8; 256];
-        cached[0x40] = 78; // JumpXEqKNil — false positive
+        cached[0x40] = 77; // JumpXEqKNil — false positive
 
         let merged = merge_cache_first(&fresh, &cached);
-        assert_eq!(merged[0x40], 60, "fresh's ForGPrepINext must override cache's JumpXEqKNil");
+        assert_eq!(merged[0x40], 59, "fresh's FORGPREP_INEXT must override cache's JumpXEqKNil");
     }
 
     /// Non-overridable conflict: cache MINUS at 0x2B vs fresh MINUS at 0x0E.
@@ -672,8 +679,10 @@ pub fn decompile_with_plan(
     // Per-chunk counters. Without this the call-recovery totals accumulate
     // across a batch run and every file after the first reports the corpus.
     crate::decompiler::call_recovery::reset();
+    crate::decompiler::reset_proto_coverage();
+    crate::decompiler::emit::reset_missing_rhs();
     let cached_opmap = if plan.exact.is_some() { None } else { plan.prior };
-    let mut chunk = parser::parse(bytecode)?;
+    let mut chunk = crate::decompiler::lifter::timed("parse", || parser::parse(bytecode))?;
 
     // A database-backed decode installs its map as ground truth for the
     // duration, so anything else in this process that consults the global sees
@@ -707,6 +716,35 @@ pub fn decompile_with_plan(
         Some((
             entry.pinned(),
             entry.map,
+            remap_unknowns,
+            unknown_byte_freq,
+            unknown_byte_sample,
+            coverage,
+        ))
+    } else if let Some(recovered) = parser::opkey::recover(&chunk) {
+        // EXACT recovery of the client's multiplicative opcode scramble.
+        //
+        // The live client stores `opcode * encode_key` (mod 256). Because that
+        // is a bijection, the key can be recovered outright instead of inferred:
+        // every odd multiplier was tried and exactly one chains all protos with
+        // zero structural offences. That is a decision, not a heuristic, so it
+        // takes precedence over the detectors below — and because nothing is
+        // completed by bijection, the coverage report for such a chunk is
+        // evidence-backed end to end.
+        let map = recovered.to_map();
+        let recovered_map = parser::opmap::OpcodeMap::from_exact_map(map);
+        let coverage = recovered_map.coverage(&chunk);
+        let (remap_unknowns, unknown_byte_freq, unknown_byte_sample) =
+            recovered_map.remap_chunk(&mut chunk);
+        eprintln!(
+            "opkey: recovered multiplicative opcode key {} (multiplier {}); \
+             {} / {} protos chain exactly",
+            recovered.encode_key, recovered.mult,
+            recovered.exact_protos, recovered.total_protos
+        );
+        Some((
+            recovered.exact_protos,
+            map,
             remap_unknowns,
             unknown_byte_freq,
             unknown_byte_sample,
@@ -867,7 +905,9 @@ pub fn decompile_with_plan(
             ctx.set_unary_semantics(entry.semantics);
         }
     }
-    let source = decompiler::decompile_proto(&mut ctx, main, main_idx, 0);
+    let source = crate::decompiler::lifter::timed("decompile_proto(main)", || {
+        decompiler::decompile_proto(&mut ctx, main, main_idx, 0)
+    });
 
     // Safety: if the decompiled source is absurdly large, truncate it
     // to prevent memory issues. This typically means expression duplication.
@@ -930,6 +970,42 @@ pub fn decompile_with_plan(
         // call count is the only thing that contradicts it. Emitted into the
         // header so `semantic_check` can read it the way it reads the proto
         // count. Measured: 29 files of 1,143 have at least one short proto.
+        // Assignments that lost their value on the way to the emitter. The
+        // emitted form is `x = nil --[[ MISSING RHS ]]`, which parses; this
+        // line says how many places the value is WRONG rather than absent.
+        {
+            let n = crate::decompiler::emit::missing_rhs_count();
+            if n > 0 {
+                header.push_str(&format!(
+                    "-- MISSING RHS: {} assignment(s) emitted as nil because no value reached them\n",
+                    n
+                ));
+            }
+        }
+        // Never let the chunk ceiling truncate silently.
+        if crate::decompiler::lifter::chunk_truncated() {
+            header.push_str(&format!(
+                "-- TRUNCATED: chunk statement ceiling hit; {} statements emitted, output INCOMPLETE\n",
+                crate::decompiler::lifter::chunk_stmt_total()
+            ));
+        }
+        // BODIES DROPPED. A proto that never reaches the emitter is the one
+        // defect the source cannot show: nothing dangles, nothing fails to
+        // parse. Diff what was emitted against what the chunk contains.
+        {
+            let emitted = crate::decompiler::proto_coverage();
+            let have: std::collections::BTreeSet<usize> = emitted.iter().copied().collect();
+            let missing: Vec<usize> = (0..chunk.protos.len()).filter(|i| !have.contains(i)).collect();
+            if !missing.is_empty() {
+                header.push_str(&format!(
+                    "-- BODIES DROPPED: {} of {} protos never reached the emitter: {:?}\n",
+                    missing.len(),
+                    chunk.protos.len(),
+                    &missing[..missing.len().min(24)]
+                ));
+                log::debug!("missing proto indices: {:?}", missing);
+            }
+        }
         let (short_protos, missing_calls) = crate::decompiler::call_recovery::snapshot();
         if short_protos > 0 {
             header.push_str(&format!(
@@ -1123,8 +1199,27 @@ pub fn bytecode_version(bytecode: &[u8]) -> Option<u8> {
 
 /// High-level API: disassemble raw bytecode into readable text
 pub fn disassemble(bytecode: &[u8], show_debug: bool) -> Result<String> {
-    let chunk = parser::parse(bytecode)?;
-    Ok(disasm::disassemble(&chunk, show_debug))
+    let mut chunk = parser::parse(bytecode)?;
+    // Exact recovery is a proof, not a guess, so it is applied here too: a
+    // scrambled client chunk that this tool can decode must not print 83,000
+    // "UNKNOWN" lines just because the caller omitted `--opmap`. Canonical
+    // chunks recover nothing and are untouched.
+    let header = match parser::opkey::recover(&chunk) {
+        Some(recovered) => {
+            let map = recovered.to_map();
+            let exact = parser::opmap::OpcodeMap::from_exact_map(map);
+            let _ = exact.remap_chunk(&mut chunk);
+            format!(
+                "; opcode key recovered exactly: encode_key {} (multiplier {}), {}/{} protos chain\n",
+                recovered.encode_key,
+                recovered.mult,
+                recovered.exact_protos,
+                recovered.total_protos
+            )
+        }
+        None => String::new(),
+    };
+    Ok(format!("{}{}", header, disasm::disassemble(&chunk, show_debug)))
 }
 
 /// Disassemble with opmap applied — applies the same shuffle detection/remap
@@ -1137,7 +1232,30 @@ pub fn disassemble_with_opmap(
     let mut chunk = parser::parse(bytecode)?;
 
     let mut header = String::new();
-    if parser::opmap::OpcodeMap::needs_remapping(&chunk) {
+    if let Some(recovered) = parser::opkey::recover(&chunk) {
+        // Same precedence as the decompile path: an exactly recovered key is
+        // tried and scored before any detector runs, because it is decidable.
+        let map = recovered.to_map();
+        let exact = parser::opmap::OpcodeMap::from_exact_map(map);
+        header.push_str(&format!(
+            "; Luau bytecode v{} — opcode key recovered exactly (encode_key {}, {}/{} protos chain)\n",
+            chunk.version, recovered.encode_key, recovered.exact_protos, recovered.total_protos
+        ));
+        header.push_str("; SHUFFLE MAP: shuffled_byte -> standard_opcode (name)\n");
+        let mut mappings: Vec<(u8, u8)> = map
+            .iter()
+            .enumerate()
+            .filter(|(_, &v)| v != 255)
+            .map(|(i, &v)| (i as u8, v))
+            .collect();
+        mappings.sort_by_key(|&(_, std)| std);
+        for (shuffled, standard) in &mappings {
+            let name = parser::opcodes::LuauOpcode::from_u8(*standard).name();
+            header.push_str(&format!(";   0x{:02X} -> {:2} {}\n", shuffled, standard, name));
+        }
+        header.push('\n');
+        let _ = exact.remap_chunk(&mut chunk);
+    } else if parser::opmap::OpcodeMap::needs_remapping(&chunk) {
         let fresh_opmap = if let Some(cached) = cached_opmap {
             parser::opmap::OpcodeMap::detect_with_prior(&chunk, cached)
         } else {

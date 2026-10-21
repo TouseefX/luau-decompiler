@@ -25,17 +25,17 @@ use luau_core::decompiler::{decompile_proto, DecompileContext};
 use luau_core::parser::types::{Chunk, Constant, Proto};
 
 // Canonical Luau opcode bytes (mirror `LuauOpcode as u8`).
-const OP_LOADN: u8 = 4;
-const OP_GETUPVAL: u8 = 9;
-const OP_GETTABLEKS: u8 = 15;
-const OP_SETTABLEKS: u8 = 16;
-const OP_NEWCLOSURE: u8 = 19;
-const OP_CALL: u8 = 21;
-const OP_RETURN: u8 = 22;
-const OP_NEWTABLE: u8 = 53;
-const OP_FORNPREP: u8 = 56;
-const OP_FORNLOOP: u8 = 57;
-const OP_CAPTURE: u8 = 70;
+const OP_LOADN: u8 = LuauOpcode::LoadN as u8;
+const OP_GETUPVAL: u8 = LuauOpcode::GetUpval as u8;
+const OP_GETTABLEKS: u8 = LuauOpcode::GetTableKS as u8;
+const OP_SETTABLEKS: u8 = LuauOpcode::SetTableKS as u8;
+const OP_NEWCLOSURE: u8 = LuauOpcode::NewClosure as u8;
+const OP_CALL: u8 = LuauOpcode::Call as u8;
+const OP_RETURN: u8 = LuauOpcode::Return as u8;
+const OP_NEWTABLE: u8 = LuauOpcode::NewTable as u8;
+const OP_FORNPREP: u8 = LuauOpcode::ForNPrep as u8;
+const OP_FORNLOOP: u8 = LuauOpcode::ForNLoop as u8;
+const OP_CAPTURE: u8 = LuauOpcode::Capture as u8;
 
 /// Encode an A/D-format instruction (op, register A, signed 16-bit D).
 fn insn_ad(op: u8, a: u8, d: i16) -> u32 {

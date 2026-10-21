@@ -31,20 +31,21 @@
 //! straight-line shapes are locked as behavioral guards.
 
 use crate::decompiler::{decompile_proto, DecompileContext};
+use crate::parser::opcodes::LuauOpcode;
 use crate::parser::types::{Chunk, Constant, Proto};
 
 // Canonical Luau opcode bytes (identity opmap, Chunk.version = 6).
-const OP_LOADNIL: u8 = 2;
-const OP_MOVE: u8 = 6;
-const OP_GETGLOBAL: u8 = 7;
-const OP_GETUPVAL: u8 = 9;
-const OP_GETIMPORT: u8 = 12;
-const OP_NEWCLOSURE: u8 = 19;
-const OP_RETURN: u8 = 22;
-const OP_JUMP: u8 = 23;
-const OP_JUMPIFNOT: u8 = 26;
-const OP_DIV: u8 = 36;
-const OP_CAPTURE: u8 = 70;
+const OP_LOADNIL: u8 = LuauOpcode::LoadNil as u8;
+const OP_MOVE: u8 = LuauOpcode::Move as u8;
+const OP_GETGLOBAL: u8 = LuauOpcode::GetGlobal as u8;
+const OP_GETUPVAL: u8 = LuauOpcode::GetUpval as u8;
+const OP_GETIMPORT: u8 = LuauOpcode::GetImport as u8;
+const OP_NEWCLOSURE: u8 = LuauOpcode::NewClosure as u8;
+const OP_RETURN: u8 = LuauOpcode::Return as u8;
+const OP_JUMP: u8 = LuauOpcode::Jump as u8;
+const OP_JUMPIFNOT: u8 = LuauOpcode::JumpIfNot as u8;
+const OP_DIV: u8 = LuauOpcode::Div as u8;
+const OP_CAPTURE: u8 = LuauOpcode::Capture as u8;
 
 fn insn_ad(op: u8, a: u8, d: i16) -> u32 {
     let du = d as u16 as u32;

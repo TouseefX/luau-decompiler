@@ -746,6 +746,16 @@ pub(super) fn inline_single_use_temps_pinned(
                             if body.len() > 20 || !is_generated_fn_name(&names[0]) {
                                 i += 1; continue;
                             }
+                            // Never inline a function that refers to itself:
+                            // `local function f() ... f() ... end` is only
+                            // expressible through the binding. Inlining it into
+                            // its call site (`(function() ... f() ... end)()`)
+                            // deletes the binding and turns the recursive call
+                            // into a call of an undefined global — the classic
+                            // "no drops, no functional change" violation.
+                            if body.iter().any(|s| stmt_reads_name_deep(s, &names[0])) {
+                                i += 1; continue;
+                            }
                             (names[0].clone(), values[0].clone())
                         }
                         _ => (names[0].clone(), values[0].clone())

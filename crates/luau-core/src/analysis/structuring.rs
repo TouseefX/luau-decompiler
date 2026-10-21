@@ -216,6 +216,11 @@ pub(crate) fn structure_block_subset(
             let merge = cfg.find_merge_point(fallthrough, branch);
             let then_blocks = collect_region_blocks(cfg, fallthrough, merge, &handled);
             let else_blocks = collect_region_blocks(cfg, branch, merge, &handled);
+
+            // Collect blocks in each branch
+            let then_blocks = collect_region_blocks(cfg, fallthrough, merge, &handled);
+            let else_blocks = collect_region_blocks(cfg, branch, merge, &handled);
+
             let ok = !then_blocks.is_empty()
                 && then_blocks.iter().all(|b| member.contains(b))
                 && else_blocks.iter().all(|b| member.contains(b))
@@ -550,7 +555,60 @@ pub fn structure_control_flow(
             // Find where branches merge
             let merge = cfg.find_merge_point(fallthrough, branch);
 
-            // Collect blocks in each branch
+            // A GUARD CLAUSE IS NOT AN UMBRELLA.
+            //
+            // `find_merge_point` returns None when the two arms never
+            // reconverge. `collect_region_blocks(branch, None)` then returns
+            // EVERY block reachable from the branch - i.e. the rest of the
+            // function - and it is emitted as the else-arm. The whole body is
+            // then lifted by the ARM lifter, which only knows loop shapes, so
+            // anything else inside it is flattened and, where the flat walk
+            // stops at a jump, silently dropped.
+            //
+            // MEASURED on the 1.8 MB client chunk: proto ?@4836 (117,864
+            // instructions) structured to exactly ONE region -
+            //     If(c0)[1 blk | 7951 blk] mNone
+            // - and its else-arm, lifted as runs, lost pcs 27097..27280: both
+            // NEWCLOSUREs and 25 CALLs.
+            //
+            // When the fall-through arm TERMINATES the shape is a guard clause
+            // (`if cond then return end`); its continuation is the branch side,
+            // which must be structured on its own. Emit the guard alone and
+            // leave the branch side unhandled for the RPO loop.
+            if merge.is_none() && std::env::var("LUAU_NO_UMBRELLA").map(|v| v != "0").unwrap_or(true) {
+                let then_blocks = collect_region_blocks(cfg, fallthrough, merge, &handled);
+                let fall_terminates = !then_blocks.is_empty()
+                    && then_blocks.iter().all(|b| {
+                        cfg.blocks.get(b).map_or(false, |blk| {
+                            // A terminating block: its last instruction is a
+                            // RETURN. `successors.is_empty()` alone is not
+                            // enough - an unreachable block also has none.
+                            let mut last = blk.start;
+                            let mut w = blk.start;
+                            while w < blk.end && w < code.len() {
+                                last = w;
+                                let o = LuauOpcode::from_u8(insn_op(code[w]));
+                                w += if o.has_aux() { 2 } else { 1 };
+                            }
+                            blk.successors.is_empty()
+                                && matches!(LuauOpcode::from_u8(insn_op(code[last])), LuauOpcode::Return)
+                        })
+                    });
+                if fall_terminates {
+                    regions.push(Region::IfThenElse {
+                        cond_pc: block_id,
+                        then_region: then_blocks.clone(),
+                        else_region: Vec::new(),
+                        merge_pc: None,
+                    });
+                    handled.insert(block_id);
+                    for &b in &then_blocks {
+                        handled.insert(b);
+                    }
+                    continue;
+                }
+            }
+
             let then_blocks = collect_region_blocks(cfg, fallthrough, merge, &handled);
             let else_blocks = collect_region_blocks(cfg, branch, merge, &handled);
 
@@ -598,6 +656,9 @@ pub fn structure_control_flow(
         }
 
         // Default: linear block
+        if std::env::var("LUAU_REGION_TRACE").is_ok() {
+            eprintln!("PUSHLIN block={} {}..{} succ={:?}", block_id, block.start, block.end, block.successors);
+        }
         regions.push(Region::Linear {
             start: block.start,
             end: block.end,
@@ -605,6 +666,42 @@ pub fn structure_control_flow(
         handled.insert(block_id);
     }
 
+    // LUAU_REGION_DUMP=<line_defined> prints EVERY top-level region for the
+    // protos defined on that source line, in one line, so an arm boundary that
+    // is wrong can be read directly instead of inferred from RUNREG ordering.
+    if let Ok(want) = std::env::var("LUAU_REGION_DUMP") {
+        if want.split(',').any(|w| w.trim().parse::<u32>() == Ok(proto.line_defined)) {
+            let mut acc = String::new();
+            for r in &regions {
+                let piece = match r {
+                    Region::Linear { start, end } => format!("Lin {}..{}", start, end),
+                    Region::IfThenElse { cond_pc, then_region, else_region, merge_pc } => format!(
+                        "If(c{})[{} blk|{} blk]m{:?}",
+                        cond_pc, then_region.len(), else_region.len(), merge_pc
+                    ),
+                    Region::ValueJoin { entry, join, .. } => format!("VJ {}..{}", entry, join),
+                    Region::NumericFor { prep_pc, loop_pc, .. } => format!("NFor {}..{}", prep_pc, loop_pc),
+                    Region::GenericFor { prep_pc, loop_pc, .. } => format!("GFor {}..{}", prep_pc, loop_pc),
+                    Region::WhileDo { header, .. } => format!("While {}", header),
+                    Region::WhileTrue { header, .. } => format!("WhileT {}", header),
+                    Region::RepeatUntil { header, cond_pc, .. } => format!("Repeat {}..{}", header, cond_pc),
+                    Region::InlineLoopInLoop { header_start, latch_pc, .. } => format!("InLoop {}..{}", header_start, latch_pc),
+                    Region::InlineIfThenInLoop { cond_pc, .. } => format!("InIf c{}", cond_pc),
+                    Region::GuardedTailIf { guards, merge, .. } => format!("Guard n{} m{}", guards.len(), merge),
+                };
+                acc.push_str(&piece);
+                acc.push_str(" | ");
+            }
+            eprintln!(
+                "REGIONDUMP {}@{} len={} n={} :: {}",
+                proto.debug_name.as_deref().unwrap_or("?"),
+                proto.line_defined,
+                code.len(),
+                regions.len(),
+                acc
+            );
+        }
+    }
     if std::env::var("LUAU_REGION_TRACE").is_ok() {
         // How much of the proto did structuring actually claim? A body that
         // vanishes with every block REACHABLE (rotation 62) must be losing its
@@ -1267,7 +1364,13 @@ pub(crate) fn structure_numeric_for_body(
             let (a, b) = v.split_once('-')?;
             Some((a.trim().parse::<usize>().ok()?, b.trim().parse::<usize>().ok()?))
         })
-        .filter(|&(a, b)| a == body_start && b == body_end);
+        // `LUAU_SHAPE_TRACE=all` traces every body, not just the one whose
+        // range matches exactly — a body boundary that is not what you assumed
+        // is exactly the thing that makes an exact-range trace print nothing.
+        .filter(|&(a, b)| {
+            a == body_start && b == body_end
+                || std::env::var("LUAU_SHAPE_TRACE").map(|v| v == "all").unwrap_or(false)
+        });
     if shape_trace.is_some() {
         eprintln!("SHAPE	scan body={}..{}", body_start, body_end);
     }

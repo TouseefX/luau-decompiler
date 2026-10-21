@@ -28,105 +28,106 @@
 //! specific pattern classes — numeric-for, short-circuit, bounds-check, …).
 
 use crate::decompiler::{decompile_proto, DecompileContext};
+use crate::parser::opcodes::LuauOpcode;
 use crate::parser::types::{Chunk, Constant, Proto};
 
 // ───────────────────────────────────────────────────────────────────────────
 // Opcode byte constants — mirror of `LuauOpcode as u8`.  Matches source of
 // truth: `Common/include/Luau/Bytecode.h` in the Luau repo.
 // ───────────────────────────────────────────────────────────────────────────
-const OP_NOP: u8           = 0;
-const OP_BREAK: u8         = 1;
-const OP_LOADNIL: u8       = 2;
-const OP_LOADB: u8         = 3;
-const OP_LOADN: u8         = 4;
-const OP_LOADK: u8         = 5;
-const OP_MOVE: u8          = 6;
-const OP_GETGLOBAL: u8     = 7;
-const OP_SETGLOBAL: u8     = 8;
-const OP_GETUPVAL: u8      = 9;
-const OP_SETUPVAL: u8      = 10;
-const OP_CLOSEUPVALS: u8   = 11;
-const OP_GETIMPORT: u8     = 12;
-const OP_GETTABLE: u8      = 13;
-const OP_SETTABLE: u8      = 14;
-const OP_GETTABLEKS: u8    = 15;
-const OP_SETTABLEKS: u8    = 16;
-const OP_GETTABLEN: u8     = 17;
-const OP_SETTABLEN: u8     = 18;
-const OP_NEWCLOSURE: u8    = 19;
-const OP_NAMECALL: u8      = 20;
-const OP_CALL: u8          = 21;
-const OP_RETURN: u8        = 22;
-const OP_JUMP: u8          = 23;
-const OP_JUMPBACK: u8      = 24;
-const OP_JUMPIF: u8        = 25;
-const OP_JUMPIFNOT: u8     = 26;
-const OP_JUMPIFEQ: u8      = 27;
-const OP_JUMPIFLE: u8      = 28;
-const OP_JUMPIFLT: u8      = 29;
-const OP_JUMPIFNOTEQ: u8   = 30;
-const OP_JUMPIFNOTLE: u8   = 31;
-const OP_JUMPIFNOTLT: u8   = 32;
-const OP_ADD: u8           = 33;
-const OP_SUB: u8           = 34;
-const OP_MUL: u8           = 35;
-const OP_DIV: u8           = 36;
-const OP_MOD: u8           = 37;
-const OP_POW: u8           = 38;
-const OP_ADDK: u8          = 39;
-const OP_SUBK: u8          = 40;
-const OP_MULK: u8          = 41;
-const OP_DIVK: u8          = 42;
-const OP_MODK: u8          = 43;
-const OP_POWK: u8          = 44;
-const OP_AND: u8           = 45;
-const OP_OR: u8            = 46;
-const OP_ANDK: u8          = 47;
-const OP_ORK: u8           = 48;
-const OP_CONCAT: u8        = 49;
-const OP_NOT: u8           = 50;
-const OP_MINUS: u8         = 51;
-const OP_LENGTH: u8        = 52;
-const OP_NEWTABLE: u8      = 53;
-const OP_DUPTABLE: u8      = 54;
-const OP_SETLIST: u8       = 55;
-const OP_FORNPREP: u8      = 56;
-const OP_FORNLOOP: u8      = 57;
-const OP_FORGPREP: u8      = 58;
-const OP_FORGLOOP: u8      = 59;
-const OP_FORGPREP_INEXT: u8 = 60;
-const OP_DEPRECATED61: u8  = 61; // was LOP_FORGLOOPINEXT
-const OP_FORGPREP_NEXT: u8 = 62;
-const OP_NATIVECALL: u8    = 63;
-const OP_GETVARARGS: u8    = 64;
-const OP_DUPCLOSURE: u8    = 82;   // NOTE: enum order in bytecode.h differs from numeric value
-const OP_PREPVARARGS: u8   = 65;
-const OP_LOADKX: u8        = 66;
-const OP_JUMPX: u8         = 67;
-const OP_FASTCALL: u8      = 68;
-const OP_COVERAGE: u8      = 69;
-const OP_CAPTURE: u8       = 70;
-const OP_SUBRK: u8         = 71;
-const OP_DIVRK: u8         = 72;
-const OP_FASTCALL1: u8     = 73;
-const OP_FASTCALL2: u8     = 74;
-const OP_FASTCALL2K: u8    = 75;
-const OP_FASTCALL3: u8     = 83;
-const OP_JUMPXEQKNIL: u8   = 78;
-const OP_JUMPXEQKB: u8     = 79;
-const OP_JUMPXEQKN: u8     = 80;
-const OP_JUMPXEQKS: u8     = 81;
-const OP_IDIV: u8          = 76;
-const OP_IDIVK: u8         = 77;
+const OP_NOP: u8           = LuauOpcode::Nop as u8;
+const OP_BREAK: u8         = LuauOpcode::Break as u8;
+const OP_LOADNIL: u8       = LuauOpcode::LoadNil as u8;
+const OP_LOADB: u8         = LuauOpcode::LoadB as u8;
+const OP_LOADN: u8         = LuauOpcode::LoadN as u8;
+const OP_LOADK: u8         = LuauOpcode::LoadK as u8;
+const OP_MOVE: u8          = LuauOpcode::Move as u8;
+const OP_GETGLOBAL: u8     = LuauOpcode::GetGlobal as u8;
+const OP_SETGLOBAL: u8     = LuauOpcode::SetGlobal as u8;
+const OP_GETUPVAL: u8      = LuauOpcode::GetUpval as u8;
+const OP_SETUPVAL: u8      = LuauOpcode::SetUpval as u8;
+const OP_CLOSEUPVALS: u8   = LuauOpcode::CloseUpvals as u8;
+const OP_GETIMPORT: u8     = LuauOpcode::GetImport as u8;
+const OP_GETTABLE: u8      = LuauOpcode::GetTable as u8;
+const OP_SETTABLE: u8      = LuauOpcode::SetTable as u8;
+const OP_GETTABLEKS: u8    = LuauOpcode::GetTableKS as u8;
+const OP_SETTABLEKS: u8    = LuauOpcode::SetTableKS as u8;
+const OP_GETTABLEN: u8     = LuauOpcode::GetTableN as u8;
+const OP_SETTABLEN: u8     = LuauOpcode::SetTableN as u8;
+const OP_NEWCLOSURE: u8    = LuauOpcode::NewClosure as u8;
+const OP_NAMECALL: u8      = LuauOpcode::NameCall as u8;
+const OP_CALL: u8          = LuauOpcode::Call as u8;
+const OP_RETURN: u8        = LuauOpcode::Return as u8;
+const OP_JUMP: u8          = LuauOpcode::Jump as u8;
+const OP_JUMPBACK: u8      = LuauOpcode::JumpBack as u8;
+const OP_JUMPIF: u8        = LuauOpcode::JumpIf as u8;
+const OP_JUMPIFNOT: u8     = LuauOpcode::JumpIfNot as u8;
+const OP_JUMPIFEQ: u8      = LuauOpcode::JumpIfEq as u8;
+const OP_JUMPIFLE: u8      = LuauOpcode::JumpIfLE as u8;
+const OP_JUMPIFLT: u8      = LuauOpcode::JumpIfLT as u8;
+const OP_JUMPIFNOTEQ: u8   = LuauOpcode::JumpIfNotEq as u8;
+const OP_JUMPIFNOTLE: u8   = LuauOpcode::JumpIfNotLE as u8;
+const OP_JUMPIFNOTLT: u8   = LuauOpcode::JumpIfNotLT as u8;
+const OP_ADD: u8           = LuauOpcode::Add as u8;
+const OP_SUB: u8           = LuauOpcode::Sub as u8;
+const OP_MUL: u8           = LuauOpcode::Mul as u8;
+const OP_DIV: u8           = LuauOpcode::Div as u8;
+const OP_MOD: u8           = LuauOpcode::Mod as u8;
+const OP_POW: u8           = LuauOpcode::Pow as u8;
+const OP_ADDK: u8          = LuauOpcode::AddK as u8;
+const OP_SUBK: u8          = LuauOpcode::SubK as u8;
+const OP_MULK: u8          = LuauOpcode::MulK as u8;
+const OP_DIVK: u8          = LuauOpcode::DivK as u8;
+const OP_MODK: u8          = LuauOpcode::ModK as u8;
+const OP_POWK: u8          = LuauOpcode::PowK as u8;
+const OP_AND: u8           = LuauOpcode::And as u8;
+const OP_OR: u8            = LuauOpcode::Or as u8;
+const OP_ANDK: u8          = LuauOpcode::AndK as u8;
+const OP_ORK: u8           = LuauOpcode::OrK as u8;
+const OP_CONCAT: u8        = LuauOpcode::Concat as u8;
+const OP_NOT: u8           = LuauOpcode::Not as u8;
+const OP_MINUS: u8         = LuauOpcode::Minus as u8;
+const OP_LENGTH: u8        = LuauOpcode::Length as u8;
+const OP_NEWTABLE: u8      = LuauOpcode::NewTable as u8;
+const OP_DUPTABLE: u8      = LuauOpcode::DupTable as u8;
+const OP_SETLIST: u8       = LuauOpcode::SetList as u8;
+const OP_FORNPREP: u8      = LuauOpcode::ForNPrep as u8;
+const OP_FORNLOOP: u8      = LuauOpcode::ForNLoop as u8;
+const OP_FORGPREP: u8      = LuauOpcode::ForGPrep as u8;
+const OP_FORGLOOP: u8      = LuauOpcode::ForGLoop as u8;
+const OP_FORGPREP_INEXT: u8 = LuauOpcode::ForGPrepINext as u8;
+const OP_DEPRECATED61: u8  = LuauOpcode::Deprecated61 as u8; // was LOP_FORGLOOPINEXT
+const OP_FORGPREP_NEXT: u8 = LuauOpcode::ForGPrepNext as u8;
+const OP_NATIVECALL: u8    = LuauOpcode::NativeCall as u8;
+const OP_GETVARARGS: u8    = LuauOpcode::GetVarargs as u8;
+const OP_DUPCLOSURE: u8    = LuauOpcode::DupClosure as u8;   // NOTE: enum order in bytecode.h differs from numeric value
+const OP_PREPVARARGS: u8   = LuauOpcode::PrepVarargs as u8;
+const OP_LOADKX: u8        = LuauOpcode::LoadKX as u8;
+const OP_JUMPX: u8         = LuauOpcode::JumpX as u8;
+const OP_FASTCALL: u8      = LuauOpcode::FastCall as u8;
+const OP_COVERAGE: u8      = LuauOpcode::Coverage as u8;
+const OP_CAPTURE: u8       = LuauOpcode::Capture as u8;
+const OP_SUBRK: u8         = LuauOpcode::SubRK as u8;
+const OP_DIVRK: u8         = LuauOpcode::DivRK as u8;
+const OP_FASTCALL1: u8     = LuauOpcode::FastCall1 as u8;
+const OP_FASTCALL2: u8     = LuauOpcode::FastCall2 as u8;
+const OP_FASTCALL2K: u8    = LuauOpcode::FastCall2K as u8;
+const OP_FASTCALL3: u8     = LuauOpcode::FastCall3 as u8;
+const OP_JUMPXEQKNIL: u8   = LuauOpcode::JumpXEqKNil as u8;
+const OP_JUMPXEQKB: u8     = LuauOpcode::JumpXEqKB as u8;
+const OP_JUMPXEQKN: u8     = LuauOpcode::JumpXEqKN as u8;
+const OP_JUMPXEQKS: u8     = LuauOpcode::JumpXEqKS as u8;
+const OP_IDIV: u8          = LuauOpcode::IDiv as u8;
+const OP_IDIVK: u8         = LuauOpcode::IDivK as u8;
 // Atom-based userdata field access (bytecode v9+) — these three opcodes are
 // present in Luau master but have no canonical u8 byte value in
 // `crates/luau-core/src/parser/opcodes.rs`.  For corpus-safety coverage we
 // pick bytes beyond the documented canonical range (84+) which the lifter
 // treats via the `Unknown` dispatch arm — the tests still verify the
 // graceful-fallback path.
-const OP_GETUDATAKS: u8    = 101;
-const OP_SETUDATAKS: u8    = 102;
-const OP_NAMECALLUDATA: u8 = 103;
+const OP_GETUDATAKS: u8    = LuauOpcode::GetUdataKS as u8;
+const OP_SETUDATAKS: u8    = LuauOpcode::SetUdataKS as u8;
+const OP_NAMECALLUDATA: u8 = LuauOpcode::NameCallUdata as u8;
 
 // ───────────────────────────────────────────────────────────────────────────
 // Instruction builders

@@ -116,6 +116,24 @@ fn emit_stat(out: &mut String, stmt: &Stat, depth: usize) {
         }
 
         Stat::Assign { targets, values } => {
+            // An assignment with no value emits `x = ` — a syntax error, and
+            // the only failure mode this pass can produce that no other check
+            // catches (the file still "validates" because validation is
+            // per-proto). Report the shape instead of guessing at the cause.
+            if values.is_empty() {
+                MISSING_RHS.with(|c| c.set(c.get() + 1));
+                if std::env::var("LUAU_RHS_DEBUG").is_ok() {
+                    let names: Vec<String> = targets.iter().map(|t| emit_expr(t, 0)).collect();
+                    eprintln!("RHS-MISSING targets={:?} depth={}", names, depth);
+                }
+                indent(out, depth);
+                let names: Vec<String> = targets.iter().map(|t| emit_expr(t, depth)).collect();
+                out.push_str(&format!(
+                    "{} = nil --[[ MISSING RHS: no value reached this assignment ]]\n",
+                    names.join(", ")
+                ));
+                return;
+            }
             // B0.111: final safety net — reject assignments whose emitted
             // target is not a valid Luau lvalue.  Post-passes like table
             // reconstruction can inline definitions into targets, creating
@@ -411,6 +429,33 @@ fn emit_stat(out: &mut String, stmt: &Stat, depth: usize) {
             }
         }
     }
+}
+
+thread_local! {
+    /// Assignments that reached the emitter with no value.
+    ///
+    /// `x = ` is a SYNTAX ERROR, and it is the one defect this crate can emit
+    /// that nothing else catches: per-proto validation sees a short body, not a
+    /// broken one, and the file still parses proto by proto. On the supplied
+    /// 1.8 MB client chunk four such statements corrupted the whole file — the
+    /// official Luau parser rejected it, so everything after the first was
+    /// unusable even though 99.9% of the source was correct.
+    ///
+    /// The emitter now writes `x = nil --[[ MISSING RHS ]]` so the file ALWAYS
+    /// parses, and counts them so the header can say how many places lost a
+    /// value. Silent `nil` would be a behaviour change; a loud, counted one is
+    /// a documented gap the caller can act on.
+    static MISSING_RHS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Reset per chunk.
+pub fn reset_missing_rhs() {
+    MISSING_RHS.with(|c| c.set(0));
+}
+
+/// How many assignments were emitted without a value this chunk.
+pub fn missing_rhs_count() -> usize {
+    MISSING_RHS.with(|c| c.get())
 }
 
 fn emit_expr(expr: &Expr, depth: usize) -> String {

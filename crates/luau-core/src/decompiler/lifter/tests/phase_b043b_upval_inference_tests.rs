@@ -19,18 +19,19 @@
 //! pattern and call `infer_main_proto_upval_names` directly.
 
 use super::super::{infer_main_proto_upval_names, is_sane_identifier};
+use crate::parser::opcodes::LuauOpcode;
 use crate::parser::types::{Constant, Proto};
 
 // Canonical (non-shuffled) Luau v6 opcode bytes.
-const OP_GETGLOBAL: u8   = 7;
-const OP_SETGLOBAL: u8   = 8;
-const OP_GETUPVAL: u8    = 9;
-const OP_GETIMPORT: u8   = 12;
-const OP_GETTABLEKS: u8  = 15;
-const OP_NEWCLOSURE: u8  = 19;
-const OP_NAMECALL: u8    = 20;
-const OP_CALL: u8        = 21;
-const OP_RETURN: u8      = 22;
+const OP_GETGLOBAL: u8   = LuauOpcode::GetGlobal as u8;
+const OP_SETGLOBAL: u8   = LuauOpcode::SetGlobal as u8;
+const OP_GETUPVAL: u8    = LuauOpcode::GetUpval as u8;
+const OP_GETIMPORT: u8   = LuauOpcode::GetImport as u8;
+const OP_GETTABLEKS: u8  = LuauOpcode::GetTableKS as u8;
+const OP_NEWCLOSURE: u8  = LuauOpcode::NewClosure as u8;
+const OP_NAMECALL: u8    = LuauOpcode::NameCall as u8;
+const OP_CALL: u8        = LuauOpcode::Call as u8;
+const OP_RETURN: u8      = LuauOpcode::Return as u8;
 
 fn insn_ad(op: u8, a: u8, d: i16) -> u32 {
     let du = d as u16 as u32;

@@ -49,27 +49,79 @@ use post_passes::{is_inlinable_literal, stmt_writes_name_recursive};
 /// the server thread runs with a 256 MB stack so we have headroom.
 const MAX_DECOMPILE_DEPTH: usize = 40;
 
-/// Phase C1 stability guard: proto-wide statement budget. Augments the
-/// existing per-range safety guards. When a single proto tries to emit
-/// more than this many statements we short-circuit the current block with
-/// a comment stub instead of continuing to bloat memory. 50,000 statements
-/// is well above any legitimate hand-written or compiled Luau proto.
+/// Phase C1 stability guard: statement budget.
+///
+/// ── WHY THERE ARE TWO LIMITS ────────────────────────────────────────────
+/// There used to be one counter, described as "proto-wide" but never reset
+/// between a proto and the closures nested inside it. On a 1.8 MB client
+/// script that is a data-loss bug, not a guard: main owns 1,609 nested
+/// closures, so ALL of their statements were charged to main's single 50,000
+/// allowance. The budget tripped at statement 50,000 and every statement after
+/// it was dropped silently — measured on the supplied ClientRenderer chunk,
+/// 314 of 1,610 proto bodies never reached the emitter and main emitted 153 of
+/// its 658 calls. Nothing else reported it: the output still parsed, no name
+/// dangled, and the truncated tail was well-formed.
+///
+/// So the accounting is per proto, as the name always claimed: a proto's
+/// allowance covers its own statements and is suspended while a nested closure
+/// lifts its own. [`MAX_STMTS_PER_CHUNK`] is the separate, much larger
+/// whole-output ceiling that actually guards memory, and when IT trips the
+/// header says so — truncation is never silent.
 pub(crate) const MAX_STMTS_PER_PROTO: usize = 50_000;
 
+/// Whole-chunk ceiling. Real bytecode runs about one statement per instruction
+/// (the supplied 1.8 MB chunk is ~3,200-word main and 238k instructions total,
+/// emitting ~58k statements), so this is ~15x headroom over the largest real
+/// input measured. It exists to bound memory on adversarial input, not to shape
+/// normal output.
+pub(crate) const MAX_STMTS_PER_CHUNK: usize = 4_000_000;
+
 thread_local! {
-    /// Running count of statements emitted for the proto currently being
-    /// lifted. Reset at the top of every `lift_proto_inner` call. Mutated
-    /// through the [`push_stat`] helper (and its in-place twin
-    /// [`note_stmts_pushed`]) so the budget is enforced everywhere the
-    /// lifter appends AST statements.
+    /// Statements emitted by the proto currently lifting.
     pub(crate) static STMTS_EMITTED: std::cell::Cell<usize> =
         std::cell::Cell::new(0);
-    /// True once we have already appended the budget-exceeded sentinel to
-    /// the outermost block for this proto. Prevents repeated comments and
-    /// marks the lifter as "tripped" so push helpers silently drop further
-    /// statements.
+    /// True once the current proto's allowance is exhausted.
     pub(crate) static STMT_BUDGET_TRIPPED: std::cell::Cell<bool> =
         std::cell::Cell::new(false);
+    /// Statements emitted for the whole chunk (all protos, nested included).
+    pub(crate) static CHUNK_STMTS: std::cell::Cell<usize> =
+        std::cell::Cell::new(0);
+    /// True once [`MAX_STMTS_PER_CHUNK`] is exhausted. Surfaced in the output
+    /// header; a chunk that trips this is INCOMPLETE and must not be presented
+    /// as whole.
+    pub(crate) static CHUNK_TRIPPED: std::cell::Cell<bool> =
+        std::cell::Cell::new(false);
+}
+
+/// Suspend the enclosing proto's accounting while a nested closure lifts.
+///
+/// Returns the saved frame; pass it to [`leave_proto_frame`].
+pub(crate) fn enter_proto_frame() -> (usize, bool) {
+    let saved = (
+        STMTS_EMITTED.with(|c| c.get()),
+        STMT_BUDGET_TRIPPED.with(|c| c.get()),
+    );
+    STMTS_EMITTED.with(|c| c.set(0));
+    // A chunk-level trip is not per-proto and must survive.
+    let chunk_tripped = CHUNK_TRIPPED.with(|c| c.get());
+    STMT_BUDGET_TRIPPED.with(|c| c.set(chunk_tripped));
+    saved
+}
+
+/// Restore the enclosing proto's accounting.
+pub(crate) fn leave_proto_frame(saved: (usize, bool)) {
+    STMTS_EMITTED.with(|c| c.set(saved.0));
+    STMT_BUDGET_TRIPPED.with(|c| c.set(saved.1));
+}
+
+/// True when the CHUNK ceiling was hit, i.e. the output is incomplete.
+pub fn chunk_truncated() -> bool {
+    CHUNK_TRIPPED.with(|c| c.get())
+}
+
+/// Total statements emitted for the chunk so far (reporting only).
+pub fn chunk_stmt_total() -> usize {
+    CHUNK_STMTS.with(|c| c.get())
 }
 
 /// Reset the proto-wide statement counter. Called at the top of every
@@ -79,6 +131,8 @@ thread_local! {
 pub(crate) fn reset_stmt_budget() {
     STMTS_EMITTED.with(|c| c.set(0));
     STMT_BUDGET_TRIPPED.with(|c| c.set(false));
+    CHUNK_STMTS.with(|c| c.set(0));
+    CHUNK_TRIPPED.with(|c| c.set(false));
 }
 
 /// Returns true if the proto-wide statement budget has been exhausted.
@@ -100,12 +154,29 @@ pub(crate) fn push_stat(block: &mut Vec<Stat>, stat: Stat) {
         return;
     }
     let current = STMTS_EMITTED.with(|c| c.get());
+    let chunk = CHUNK_STMTS.with(|c| c.get());
+    if chunk >= MAX_STMTS_PER_CHUNK {
+        CHUNK_TRIPPED.with(|c| c.set(true));
+        STMT_BUDGET_TRIPPED.with(|c| c.set(true));
+        block.push(Stat::Comment(
+            "-- CHUNK STATEMENT BUDGET EXCEEDED: output is INCOMPLETE".to_string(),
+        ));
+        return;
+    }
     if current >= MAX_STMTS_PER_PROTO {
+        if std::env::var("LUAU_BUDGET_TRACE").is_ok() {
+            eprintln!(
+                "BUDGET-TRIP proto={} at {} statements",
+                crate::decompiler::current_proto_name(),
+                current
+            );
+        }
         STMT_BUDGET_TRIPPED.with(|c| c.set(true));
         block.push(Stat::Comment("-- statement budget exceeded".to_string()));
         return;
     }
     STMTS_EMITTED.with(|c| c.set(current + 1));
+    CHUNK_STMTS.with(|c| c.set(chunk + 1));
     block.push(stat);
 }
 
@@ -121,6 +192,16 @@ pub(crate) fn note_stmts_pushed(block: &mut Vec<Stat>, count: usize) {
     }
     let current = STMTS_EMITTED.with(|c| c.get());
     let new_total = current.saturating_add(count);
+    let chunk_new = CHUNK_STMTS.with(|c| c.get()).saturating_add(count);
+    CHUNK_STMTS.with(|c| c.set(chunk_new.min(MAX_STMTS_PER_CHUNK + 1)));
+    if chunk_new > MAX_STMTS_PER_CHUNK {
+        CHUNK_TRIPPED.with(|c| c.set(true));
+        STMT_BUDGET_TRIPPED.with(|c| c.set(true));
+        block.push(Stat::Comment(
+            "-- CHUNK STATEMENT BUDGET EXCEEDED: output is INCOMPLETE".to_string(),
+        ));
+        return;
+    }
     if new_total > MAX_STMTS_PER_PROTO {
         STMT_BUDGET_TRIPPED.with(|c| c.set(true));
         // Truncate block back down to whatever fits, then append sentinel.
@@ -928,7 +1009,18 @@ fn count_calls_expr(e: &Expr) -> usize {
 }
 
 pub(super) fn lift_proto_inner(ctx: &mut DecompileContext, proto: &Proto, proto_index: usize, depth: usize) -> Vec<Stat> {
+    crate::decompiler::note_proto_emitted(proto_index);
+    // Each proto gets its own allowance; the enclosing proto's accounting is
+    // suspended for the duration (see `MAX_STMTS_PER_PROTO`).
+    let frame = enter_proto_frame();
+    crate::decompiler::set_current_proto_name(&format!(
+        "#{} {}@{}",
+        proto_index,
+        proto.debug_name.as_deref().unwrap_or("?"),
+        proto.line_defined
+    ));
     let out = lift_proto_inner_impl(ctx, proto, proto_index, depth);
+    leave_proto_frame(frame);
     // Always recorded, not gated: this feeds a semantic check, not a trace.
     {
         // A CALL IN PROVABLY-DEAD CODE IS NOT A DROPPED CALL.
@@ -1043,6 +1135,30 @@ pub(super) fn lift_proto_inner(ctx: &mut DecompileContext, proto: &Proto, proto_
             calls,
             count_calls_stats(&out)
         );
+    }
+    out
+}
+
+
+/// Time one post-pass when `LUAU_TIMING` is set.
+///
+/// A 1.8 MB chunk is ~45,000 statements in a single main proto, and the
+/// post-pass chain runs over that block ~30 times. Any pass that is quadratic
+/// in statements turns a 2-minute decompile into a 20-minute one, and the
+/// pass responsible is invisible without per-pass timings. Prints to stderr so
+/// it never contaminates decompiled output.
+pub(crate) fn timed<T>(name: &str, f: impl FnOnce() -> T) -> T {
+    if std::env::var("LUAU_TIMING").is_err() {
+        return f();
+    }
+    if std::env::var("LUAU_TIMING_VERBOSE").is_ok() {
+        eprintln!("BEGIN  {}", name);
+    }
+    let t = std::time::Instant::now();
+    let out = f();
+    let ms = t.elapsed().as_millis();
+    if ms >= 20 {
+        eprintln!("TIMING {:<42} {:>7} ms", name, ms);
     }
     out
 }
@@ -1211,14 +1327,14 @@ fn lift_proto_inner_impl(ctx: &mut DecompileContext, proto: &Proto, proto_index:
     // output at all for the proto being investigated.
     set_dce_proto(proto.debug_name.as_deref().unwrap_or("?"), proto.line_defined);
     // Post-processing: eliminate dead stores and collapse control flow
-    simplify_stmts(&mut stmts);
+    timed("simplify_stmts", || simplify_stmts(&mut stmts));
     pass_probe(proto, "simplify_stmts", &stmts);
     if std::env::var("LUAU_PASS_TRACE").is_ok() {
         eprintln!("PASS proto={}@{} after_simplify_stmts calls={}",
             proto.debug_name.as_deref().unwrap_or("?"), proto.line_defined,
             count_calls_stats(&stmts));
     }
-    eliminate_dead_stores(&mut stmts);
+    timed("eliminate_dead_stores", || eliminate_dead_stores(&mut stmts));
     pass_probe(proto, "eliminate_dead_stores", &stmts);
     if std::env::var("LUAU_PASS_TRACE").is_ok() {
         eprintln!("PASS proto={}@{} after_eliminate_dead_stores calls={}",
@@ -1226,7 +1342,7 @@ fn lift_proto_inner_impl(ctx: &mut DecompileContext, proto: &Proto, proto_index:
             count_calls_stats(&stmts));
     }
     if std::env::var("LUAU_NO_DCE").is_err() {
-        eliminate_dead_code(&mut stmts);
+        timed("eliminate_dead_code", || eliminate_dead_code(&mut stmts));
     }
     pass_probe(proto, "eliminate_dead_code", &stmts);
     if std::env::var("LUAU_PASS_TRACE").is_ok() {
@@ -1238,7 +1354,7 @@ fn lift_proto_inner_impl(ctx: &mut DecompileContext, proto: &Proto, proto_index:
     // C10j: also drop `local v_N = <pure_rhs>` for bare literals/Name/Field
     // chains when never read/written downstream.
     // Second dead-code sweep because these drops can leave empty-if shells.
-    eliminate_dead_key_eq_value_locals(&mut stmts);
+    timed("eliminate_dead_key_eq_value_locals", || eliminate_dead_key_eq_value_locals(&mut stmts));
     pass_probe(proto, "eliminate_dead_key_eq_value_locals", &stmts);
     if std::env::var("LUAU_PASS_TRACE").is_ok() {
         eprintln!("PASS proto={}@{} after_eliminate_dead_key_eq_value_locals calls={}",
@@ -1254,21 +1370,21 @@ fn lift_proto_inner_impl(ctx: &mut DecompileContext, proto: &Proto, proto_index:
     // `while true do <body>; if cond then break end end`. Must run BEFORE
     // `convert_single_pass_loops` so the trailing `if cond then break end`
     // is still present (single-pass collapse would rewrite it into an if/else).
-    convert_while_true_break_to_repeat(&mut stmts);
+    timed("convert_while_true_break_to_repeat", || convert_while_true_break_to_repeat(&mut stmts));
     pass_probe(proto, "convert_while_true_break_to_repeat", &stmts);
     if std::env::var("LUAU_PASS_TRACE").is_ok() {
         eprintln!("PASS proto={}@{} after_convert_while_true_break_to_repeat calls={}",
             proto.debug_name.as_deref().unwrap_or("?"), proto.line_defined,
             count_calls_stats(&stmts));
     }
-    convert_single_pass_loops(&mut stmts);
+    timed("convert_single_pass_loops", || convert_single_pass_loops(&mut stmts));
     pass_probe(proto, "convert_single_pass_loops", &stmts);
     if std::env::var("LUAU_PASS_TRACE").is_ok() {
         eprintln!("PASS proto={}@{} after_convert_single_pass_loops calls={}",
             proto.debug_name.as_deref().unwrap_or("?"), proto.line_defined,
             count_calls_stats(&stmts));
     }
-    collapse_elseif_chains(&mut stmts);
+    timed("collapse_elseif_chains", || collapse_elseif_chains(&mut stmts));
     pass_probe(proto, "collapse_elseif_chains", &stmts);
     if std::env::var("LUAU_PASS_TRACE").is_ok() {
         eprintln!("PASS proto={}@{} after_collapse_elseif_chains calls={}",
@@ -1285,17 +1401,17 @@ fn lift_proto_inner_impl(ctx: &mut DecompileContext, proto: &Proto, proto_index:
             proto.debug_name.as_deref().unwrap_or("?"), proto.line_defined,
             count_calls_stats(&stmts));
     }
-    post_passes::collapse_if_assign_bool(&mut stmts);
+    timed("post_passes::collapse_if_assign_bool", || post_passes::collapse_if_assign_bool(&mut stmts));
     pass_probe(proto, "collapse_if_assign_bool", &stmts);
 
-    collapse_short_circuit_assignments(&mut stmts);
+    timed("collapse_short_circuit_assignments", || collapse_short_circuit_assignments(&mut stmts));
     pass_probe(proto, "collapse_short_circuit_assignments", &stmts);
 
     // Phase B0.89: merge `local x = nil; x = expr` into `local x = expr`.
     // Must run BEFORE B0.87/88 so that `local x = nil; x = expr; if ...`
     // patterns are simplified first (the nil→expr merge may expose a new
     // ternary pattern for B0.87/88).
-    post_passes::merge_dead_init_with_assignment(&mut stmts);
+    timed("post_passes::merge_dead_init_with_assignment", || post_passes::merge_dead_init_with_assignment(&mut stmts));
     pass_probe(proto, "merge_dead_init_with_assignment", &stmts);
 
     // Phase B0.87/88: collapse `local x = <init>; if cond then x = a [else x = b] end`
@@ -1303,10 +1419,10 @@ fn lift_proto_inner_impl(ctx: &mut DecompileContext, proto: &Proto, proto_index:
     // Must run AFTER collapse_short_circuit_assignments (which handles the
     // self-referencing `if x then x = a end` shape separately) and BEFORE
     // inline_single_use_temps (which benefits from the reduced read-count).
-    collapse_nil_init_conditional(&mut stmts);
+    timed("collapse_nil_init_conditional", || collapse_nil_init_conditional(&mut stmts));
     pass_probe(proto, "collapse_nil_init_conditional", &stmts);
 
-    rename_upvals(&mut stmts);
+    timed("rename_upvals", || rename_upvals(&mut stmts));
 
     // Phase C2 pass #2: recursive upvalue name propagation (bounded fixpoint).
     //
@@ -1340,12 +1456,12 @@ fn lift_proto_inner_impl(ctx: &mut DecompileContext, proto: &Proto, proto_index:
     }
 
     // Clean up decompiler artifacts
-    cleanup_stmts(&mut stmts);
+    timed("cleanup_stmts", || cleanup_stmts(&mut stmts));
     pass_probe(proto, "cleanup_stmts", &stmts);
 
     // Collapse method chains: `local v0 = obj:M1()` + `v0 = v0:M2(args)` → `local v0 = obj:M1():M2(args)`
     // Also collapses different-name chains: `call = X()` + `call2 = call:M()` → `call2 = X():M()`
-    collapse_method_chains(&mut stmts);
+    timed("collapse_method_chains", || collapse_method_chains(&mut stmts));
     pass_probe(proto, "collapse_method_chains", &stmts);
 
     // Phase B0.47: Reconstruct module-style table constructors from the
@@ -1353,7 +1469,7 @@ fn lift_proto_inner_impl(ctx: &mut DecompileContext, proto: &Proto, proto_index:
     // `inline_single_use_temps` because removing the intermediate field
     // assignments changes the read-count of `M`, which `inline_single_use_temps`
     // uses to decide whether to inline the table value.
-    reconstruct_table_constructors(&mut stmts);
+    timed("reconstruct_table_constructors", || reconstruct_table_constructors(&mut stmts));
     pass_probe(proto, "reconstruct_table_constructors", &stmts);
 
     // Phase C2: SETLIST / sequential-integer-index coalesce.  Converts
@@ -1363,20 +1479,20 @@ fn lift_proto_inner_impl(ctx: &mut DecompileContext, proto: &Proto, proto_index:
     // AFTER `reconstruct_table_constructors` so it operates on the already-
     // folded Table constructor.  Purely cosmetic: no name-read-count side
     // effects, so order relative to `inline_single_use_temps` is free.
-    coalesce_setlist_sequential(&mut stmts);
+    timed("coalesce_setlist_sequential", || coalesce_setlist_sequential(&mut stmts));
 
     // Phase C10O: unwrap `local R = {K = inner}; require(R)` → `require(inner)`.
     // Must run BEFORE inline_single_use_temps — that pass has a B0.114 guard
     // that refuses to inline tables into require() args, so the wrapper local
     // would otherwise persist. C10O handles the pre-materialized case
     // directly; C8 (CALL-time) already covers the inline form.
-    post_passes::unwrap_require_wrapper_locals(&mut stmts);
+    timed("post_passes::unwrap_require_wrapper_locals", || post_passes::unwrap_require_wrapper_locals(&mut stmts));
 
     // Phase C10P: rename `local serviceN = game:GetService("X")` locals to X.
     // Upstream LITERAL_NAMING_METHODS logic (mod.rs) is supposed to propagate
     // the string arg into the register hint, but ~1112 corpus locals still
     // surface as generic `serviceN`. This post-pass catches the survivors.
-    post_passes::rename_service_locals(&mut stmts);
+    timed("post_passes::rename_service_locals", || post_passes::rename_service_locals(&mut stmts));
 
     // Inline single-use call/method temps into their use sites:
     // `call7 = chain:Build()` + `call8 = Y:Add(call7)` → `call8 = Y:Add(chain:Build())`
@@ -1393,7 +1509,7 @@ fn lift_proto_inner_impl(ctx: &mut DecompileContext, proto: &Proto, proto_index:
     // the Roblox pattern where a register is reused with multiple
     // LOADK loads, e.g. `local v3 = "Players"; game:GetService(v3); ...`
     // becomes `game:GetService("Players")` etc.
-    inline_pure_literals(&mut stmts);
+    timed("inline_pure_literals", || inline_pure_literals(&mut stmts));
 
     // Phase C2: fold multi-return call unpack pattern
     //   `local v1,v2,v3 = f()` + `x.a=v1; x.b=v2; x.c=v3`
@@ -1401,10 +1517,10 @@ fn lift_proto_inner_impl(ctx: &mut DecompileContext, proto: &Proto, proto_index:
     // Runs AFTER inline_single_use_temps so the simple one-to-one single-use
     // case is already collapsed; any surviving scattered-unpack cluster is
     // the N-ary pattern this fold targets.
-    post_passes::fold_multireturn_unpack(&mut stmts);
+    timed("post_passes::fold_multireturn_unpack", || post_passes::fold_multireturn_unpack(&mut stmts));
 
     // Run chain collapse again — inlining may create new consecutive chain opportunities
-    collapse_method_chains(&mut stmts);
+    timed("collapse_method_chains", || collapse_method_chains(&mut stmts));
 
     // Phase B0.60: reconstruct Luau method-function syntax from the
     // two-step `local F = function(...) end; Base.X = F` pattern that
@@ -1414,7 +1530,7 @@ fn lift_proto_inner_impl(ctx: &mut DecompileContext, proto: &Proto, proto_index:
     // then renders as `function Base:X(...) end` (proper Luau method
     // syntax). Runs AFTER inline_single_use_temps so any folded temps
     // are cleaned up first.
-    post_passes::reconstruct_method_assignments(&mut stmts);
+    timed("post_passes::reconstruct_method_assignments", || post_passes::reconstruct_method_assignments(&mut stmts));
 
     // Phase C10S: drop `setmetatable.X = ...` / `function pcall.Y() end`
     // and similar stdlib-function-lvalue artifacts. These only appear
@@ -1424,13 +1540,13 @@ fn lift_proto_inner_impl(ctx: &mut DecompileContext, proto: &Proto, proto_index:
     // so the resulting statement is pure decompiler noise. Runs AFTER
     // reconstruct_method_assignments so both the raw `Stat::Assign`
     // artifact AND any `Stat::MethodFunction` form get swept.
-    post_passes::drop_stdlib_function_lvalue_artifacts(&mut stmts);
+    timed("post_passes::drop_stdlib_function_lvalue_artifacts", || post_passes::drop_stdlib_function_lvalue_artifacts(&mut stmts));
 
     // B0.119: Convert `local fn = function(...) ... end` to the idiomatic
     // `local function fn(...) ... end` form. Runs AFTER method-function
     // reconstruction (which may absorb some of these into Base:Method style)
     // and AFTER inline_single_use_temps (which may inline closures).
-    convert_local_function_sugar(&mut stmts);
+    timed("convert_local_function_sugar", || convert_local_function_sugar(&mut stmts));
 
     // Phase C2 pass #5: convert `T.m = function(self, ...)` to idiomatic
     // `function T:m(...)` when the body uses `self.x` or `self:y()` at
@@ -1438,27 +1554,27 @@ fn lift_proto_inner_impl(ctx: &mut DecompileContext, proto: &Proto, proto_index:
     // handles the two-step local-then-assign pattern) so this pass picks
     // up the remaining direct-assign shapes. Must run AFTER all temp-
     // inlining and naming so the self-count is accurate.
-    post_passes::convert_dot_to_method_function(&mut stmts);
+    timed("post_passes::convert_dot_to_method_function", || post_passes::convert_dot_to_method_function(&mut stmts));
 
     // Fold constant expressions (3 + 4 → 7, "a" .. "b" → "ab", etc.)
-    fold_constants_in_stmts(&mut stmts);
+    timed("fold_constants_in_stmts", || fold_constants_in_stmts(&mut stmts));
 
     // C10h: after fold, `if "utf8" == "utf8" then X end` becomes
     // `if true then X end`. Splice into parent. Always-false becomes
     // `if false then X else Y end` → Y.
-    collapse_constant_ifs(&mut stmts);
+    timed("collapse_constant_ifs", || collapse_constant_ifs(&mut stmts));
 
     // Phase B0.93c: collapse `if cond then return true else return false end`
     // into `return cond`. Must run AFTER fold_constants (which may simplify
     // conditions) and AFTER collapse_nil_init_conditional (which may convert
     // if/assign patterns that look similar but aren't return-based).
-    post_passes::collapse_if_return_bool(&mut stmts);
+    timed("post_passes::collapse_if_return_bool", || post_passes::collapse_if_return_bool(&mut stmts));
 
     // Phase B0.97: collapse `if cond then return a else return b end`
     // into `return if cond then a else b`. Also handles the fallthrough
     // pattern `if cond then return a end; return b`. Must run AFTER
     // collapse_if_return_bool so bool-specific `return cond` fires first.
-    post_passes::collapse_if_return_ternary(&mut stmts);
+    timed("post_passes::collapse_if_return_ternary", || post_passes::collapse_if_return_ternary(&mut stmts));
 
     crate::decompiler::walk_cover::report(
         proto.debug_name.as_deref().unwrap_or("?"),
@@ -5671,7 +5787,10 @@ fn simplify_expr(expr: &Expr) -> Expr {
                     BinOp::Mul  => Some(a * b),
                     BinOp::Div  if *b != 0.0 => Some(a / b),
                     BinOp::IDiv if *b != 0.0 => Some((a / b).floor()),
-                    BinOp::Mod  if *b != 0.0 => Some(a % b),
+                    // Luau's modulo is FLOORED (`a - floor(a/b)*b`), not
+                    // Rust's truncated remainder: -7 % 3 is 2 in Luau and -1
+                    // in Rust. Folding with `%` silently changed the result.
+                    BinOp::Mod  if *b != 0.0 => Some(a - (a / b).floor() * b),
                     BinOp::Pow  => Some(a.powf(*b)),
                     _ => None,
                 };
@@ -6003,49 +6122,203 @@ fn simplify_stmts(stmts: &mut Vec<Stat>) {
 
 // ---------------------------------------------------------------------------
 /// Also recursively processes nested statements in control flow.
+/// Collect the names a statement reads, with exactly the traversal of
+/// [`stmt_reads_name`] (and therefore of [`expr_uses_name`], which treats a
+/// closure as opaque — closures capture by upvalue, not by name).
+///
+/// The SHALLOW counterpart of [`collect_read_names`]. The two differ on
+/// purpose: `stmt_reads_name` does not descend into `Expr::Function`, so a
+/// pass built on it must not either, or it would see reads that the predicate
+/// it replaced never saw.
+fn collect_local_read_names(stmt: &Stat, out: &mut Vec<String>) {
+    match stmt {
+        Stat::Local { values, .. } => values.iter().for_each(|v| collect_local_read_names_expr(v, out)),
+        Stat::Assign { targets, values } => {
+            values.iter().for_each(|v| collect_local_read_names_expr(v, out));
+            for t in targets {
+                if !matches!(t, Expr::Name(_)) {
+                    collect_local_read_names_expr(t, out);
+                }
+            }
+        }
+        Stat::ExprStat(e) => collect_local_read_names_expr(e, out),
+        Stat::Return { values } => values.iter().for_each(|v| collect_local_read_names_expr(v, out)),
+        Stat::If { condition, then_body, elseif_clauses, else_body } => {
+            collect_local_read_names_expr(condition, out);
+            then_body.iter().for_each(|s| collect_local_read_names(s, out));
+            for (c, b) in elseif_clauses {
+                collect_local_read_names_expr(c, out);
+                b.iter().for_each(|s| collect_local_read_names(s, out));
+            }
+            if let Some(eb) = else_body {
+                eb.iter().for_each(|s| collect_local_read_names(s, out));
+            }
+        }
+        Stat::While { condition, body } => {
+            collect_local_read_names_expr(condition, out);
+            body.iter().for_each(|s| collect_local_read_names(s, out));
+        }
+        Stat::Repeat { body, condition } => {
+            body.iter().for_each(|s| collect_local_read_names(s, out));
+            collect_local_read_names_expr(condition, out);
+        }
+        Stat::NumericFor { start, stop, step, body, .. } => {
+            collect_local_read_names_expr(start, out);
+            collect_local_read_names_expr(stop, out);
+            if let Some(st) = step {
+                collect_local_read_names_expr(st, out);
+            }
+            body.iter().for_each(|s| collect_local_read_names(s, out));
+        }
+        Stat::GenericFor { iterators, body, .. } => {
+            iterators.iter().for_each(|it| collect_local_read_names_expr(it, out));
+            body.iter().for_each(|s| collect_local_read_names(s, out));
+        }
+        Stat::DoBlock { body } => body.iter().for_each(|s| collect_local_read_names(s, out)),
+        _ => {}
+    }
+}
+
+fn collect_local_read_names_expr(expr: &Expr, out: &mut Vec<String>) {
+    match expr {
+        Expr::Name(n) => out.push(n.clone()),
+        Expr::Field { object, .. } => collect_local_read_names_expr(object, out),
+        Expr::Index { object, key } => {
+            collect_local_read_names_expr(object, out);
+            collect_local_read_names_expr(key, out);
+        }
+        Expr::BinOp { left, right, .. } => {
+            collect_local_read_names_expr(left, out);
+            collect_local_read_names_expr(right, out);
+        }
+        Expr::UnOp { operand, .. } => collect_local_read_names_expr(operand, out),
+        Expr::Call { func, args } => {
+            collect_local_read_names_expr(func, out);
+            args.iter().for_each(|a| collect_local_read_names_expr(a, out));
+        }
+        Expr::MethodCall { object, args, .. } => {
+            collect_local_read_names_expr(object, out);
+            args.iter().for_each(|a| collect_local_read_names_expr(a, out));
+        }
+        Expr::Table { fields } => {
+            for f in fields {
+                match f {
+                    TableField::Sequential(e) => collect_local_read_names_expr(e, out),
+                    TableField::Named(_, e) => collect_local_read_names_expr(e, out),
+                    TableField::Indexed(k, v) => {
+                        collect_local_read_names_expr(k, out);
+                        collect_local_read_names_expr(v, out);
+                    }
+                }
+            }
+        }
+        // Opaque, exactly like `expr_uses_name`.
+        Expr::Function { .. } => {}
+        Expr::Ternary { cond, then_expr, else_expr } => {
+            collect_local_read_names_expr(cond, out);
+            collect_local_read_names_expr(then_expr, out);
+            collect_local_read_names_expr(else_expr, out);
+        }
+        _ => {}
+    }
+}
+
+/// Is `name` read by a statement at an index in `(lo, hi)`?
+fn name_read_between(
+    index: &std::collections::HashMap<String, Vec<usize>>,
+    name: &str,
+    lo: usize,
+    hi: usize,
+) -> bool {
+    match index.get(name) {
+        Some(v) => {
+            let k = v.partition_point(|&j| j <= lo);
+            k < v.len() && v[k] < hi
+        }
+        None => false,
+    }
+}
+
 fn eliminate_dead_stores(stmts: &mut Vec<Stat>) {
+    // ── WHY THIS IS INDEXED ─────────────────────────────────────────────────
+    // The obvious form — for every assignment, scan forward to the end of the
+    // block looking for the next write to the same variable, walking each
+    // intervening statement's whole subtree for reads — is O(n^2) in statements
+    // with a large constant. On a 1.8 MB client script main is ~45,000
+    // statements, so that scan is ~10^9 subtree walks: measured at over 100
+    // seconds in this one pass, which is where the whole decompile went.
+    //
+    // The forward scan only needs to reach the NEXT write of the name — past
+    // that point the loop breaks anyway. Indexing the single-Name writes up
+    // front turns "scan to end of block" into "scan to the next write, or skip
+    // entirely when the name is never written again". Behaviour is unchanged;
+    // the only difference is that the irrelevant tail is never walked.
+    use std::collections::HashMap;
+
+    let mut writes: HashMap<String, Vec<usize>> = HashMap::new();
+    let mut read_index: HashMap<String, Vec<usize>> = HashMap::new();
+    {
+        let mut buf: Vec<String> = Vec::new();
+        for (idx, st) in stmts.iter().enumerate() {
+            if let Stat::Assign { targets, .. } = st {
+                if targets.len() == 1 {
+                    if let Expr::Name(n) = &targets[0] {
+                        writes.entry(n.clone()).or_default().push(idx);
+                    }
+                }
+            }
+            // One walk per statement, reused by every range query below. The
+            // alternative — walking each statement's subtree again for every
+            // query — is the quadratic scan this index replaces.
+            buf.clear();
+            collect_local_read_names(st, &mut buf);
+            for n in buf.drain(..) {
+                read_index.entry(n).or_default().push(idx);
+            }
+        }
+    }
+
+    // Marks instead of `Vec::remove`, so the index stays valid while scanning.
+    // A marked statement is always to the RIGHT of the cursor, so skipping
+    // marked entries reproduces the original "remove and re-test" behaviour.
+    let mut deleted = vec![false; stmts.len()];
+
     let mut i = 0;
     while i < stmts.len() {
         let should_remove = {
-            // Look for assignments that have another assignment to the same target shortly after
             if let Stat::Assign { targets, .. } = &stmts[i] {
                 if targets.len() == 1 {
                     if let Expr::Name(var_name) = &targets[0] {
-                        // Scan forward for the next write to this variable
-                        let mut found_overwrite = false;
-                        for j in (i + 1)..stmts.len() {
-                            match &stmts[j] {
-                                // Found an assignment to the same variable - this is a dead store.
-                                // The guard must require a Name target matching var_name: a
-                                // broader guard (e.g. just `t2.len() == 1`) would also capture
-                                // `t[k] = x`, `t.f = x` and `y = f(x)`, whose reads of var_name
-                                // would then never reach the stmt_reads_name arm below.
-                                Stat::Assign { targets: t2, values: v2 }
-                                    if t2.len() == 1
-                                        && matches!(&t2[0], Expr::Name(n2) if n2 == var_name) =>
-                                {
-                                    // Only a dead store if the overwriting RHS
-                                    // does NOT read the variable being assigned.
-                                    // e.g. `x = 5; x = x + 3` — first store is NOT dead.
-                                    let rhs_uses_var =
-                                        v2.iter().any(|v| expr_uses_name(v, var_name));
-                                    if !rhs_uses_var {
-                                        found_overwrite = true;
+                        // First surviving write to this name after `i`.
+                        match writes.get(var_name.as_str()).and_then(|v| {
+                            let k = v.partition_point(|&j| j <= i);
+                            v[k..].iter().copied().find(|&j| !deleted[j])
+                        }) {
+                            // NOTHING TO REACH. A name never written again
+                            // cannot hold a dead store — the old scan ran to
+                            // the end of the block and found no overwrite. That
+                            // unbounded scan, repeated per assignment, is what
+                            // made this pass quadratic on a 45,000-statement
+                            // main: the overwhelmingly common case (a variable
+                            // assigned once) paid the full O(n) walk for a
+                            // guaranteed `false`. Skip it.
+                            None => false,
+                            Some(j) => {
+                                // Past the next write the loop breaks, so that
+                                // is the only region that matters.
+                                let blocked = name_read_between(&read_index, var_name, i, j);
+                                if blocked {
+                                    false
+                                } else {
+                                    match &stmts[j] {
+                                        Stat::Assign { values: v2, .. } => {
+                                            !v2.iter().any(|v| expr_uses_name(v, var_name))
+                                        }
+                                        _ => false,
                                     }
-                                    break;
-                                }
-                                    // Phase B0.92: use stmt_reads_name to precisely check
-                                // whether intervening statements reference the variable.
-                                // Stops on any read (including through control flow).
-                                other => {
-                                    if stmt_reads_name(other, var_name) {
-                                        break;
-                                    }
-                                    // Statement doesn't read the variable — safe to continue.
                                 }
                             }
                         }
-                        found_overwrite
                     } else {
                         false
                     }
@@ -6058,10 +6331,9 @@ fn eliminate_dead_stores(stmts: &mut Vec<Stat>) {
         };
 
         if should_remove {
-            stmts.remove(i);
-            // Don't increment i, check the same position again (it now has the next statement)
+            deleted[i] = true;
         } else {
-            // Recursively process nested statements
+            // Recursively process nested statements.
             match &mut stmts[i] {
                 Stat::If { then_body, elseif_clauses, else_body, .. } => {
                     eliminate_dead_stores(then_body);
@@ -6080,9 +6352,17 @@ fn eliminate_dead_stores(stmts: &mut Vec<Stat>) {
                 }
                 _ => {}
             }
-            i += 1;
         }
+        i += 1;
     }
+
+    // Compact once, preserving order.
+    let mut idx = 0;
+    stmts.retain(|_| {
+        let keep = !deleted[idx];
+        idx += 1;
+        keep
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -6198,6 +6478,153 @@ fn stmt_reads_name_deep(stmt: &Stat, name: &str) -> bool {
     }
 }
 
+/// Collect the names a statement READS, with exactly the traversal of
+/// [`stmt_reads_name_deep`] — including into closure bodies, because a closure
+/// reads outer locals as upvalues.
+///
+/// Exists so a pass that asks "is `x` read anywhere downstream?" N times can
+/// pay for the walk once per statement instead of once per (statement, name)
+/// pair. The two must stay in step: if `stmt_reads_name_deep` grows a variant,
+/// this must grow it too, or the index will under-report reads and the pass
+/// will drop a live local.
+fn collect_read_names(stmt: &Stat, out: &mut Vec<String>) {
+    match stmt {
+        Stat::Local { values, .. } => values.iter().for_each(|v| collect_read_names_expr(v, out)),
+        Stat::Assign { targets, values } => {
+            values.iter().for_each(|v| collect_read_names_expr(v, out));
+            for t in targets {
+                if !matches!(t, Expr::Name(_)) {
+                    collect_read_names_expr(t, out);
+                }
+            }
+        }
+        Stat::ExprStat(e) => collect_read_names_expr(e, out),
+        Stat::Return { values } => values.iter().for_each(|v| collect_read_names_expr(v, out)),
+        Stat::If { condition, then_body, elseif_clauses, else_body } => {
+            collect_read_names_expr(condition, out);
+            then_body.iter().for_each(|s| collect_read_names(s, out));
+            for (c, b) in elseif_clauses {
+                collect_read_names_expr(c, out);
+                b.iter().for_each(|s| collect_read_names(s, out));
+            }
+            if let Some(eb) = else_body {
+                eb.iter().for_each(|s| collect_read_names(s, out));
+            }
+        }
+        Stat::While { condition, body } => {
+            collect_read_names_expr(condition, out);
+            body.iter().for_each(|s| collect_read_names(s, out));
+        }
+        Stat::Repeat { body, condition } => {
+            body.iter().for_each(|s| collect_read_names(s, out));
+            collect_read_names_expr(condition, out);
+        }
+        Stat::NumericFor { start, stop, step, body, .. } => {
+            collect_read_names_expr(start, out);
+            collect_read_names_expr(stop, out);
+            if let Some(st) = step {
+                collect_read_names_expr(st, out);
+            }
+            body.iter().for_each(|s| collect_read_names(s, out));
+        }
+        Stat::GenericFor { iterators, body, .. } => {
+            iterators.iter().for_each(|it| collect_read_names_expr(it, out));
+            body.iter().for_each(|s| collect_read_names(s, out));
+        }
+        Stat::DoBlock { body } => body.iter().for_each(|s| collect_read_names(s, out)),
+        Stat::LocalFunction { func, .. } | Stat::MethodFunction { func, .. } => {
+            collect_read_names_expr(func, out)
+        }
+        _ => {}
+    }
+}
+
+fn collect_read_names_expr(expr: &Expr, out: &mut Vec<String>) {
+    match expr {
+        Expr::Name(n) => out.push(n.clone()),
+        Expr::Field { object, .. } => collect_read_names_expr(object, out),
+        Expr::Index { object, key } => {
+            collect_read_names_expr(object, out);
+            collect_read_names_expr(key, out);
+        }
+        Expr::BinOp { left, right, .. } => {
+            collect_read_names_expr(left, out);
+            collect_read_names_expr(right, out);
+        }
+        Expr::UnOp { operand, .. } => collect_read_names_expr(operand, out),
+        Expr::Call { func, args } => {
+            collect_read_names_expr(func, out);
+            args.iter().for_each(|a| collect_read_names_expr(a, out));
+        }
+        Expr::MethodCall { object, args, .. } => {
+            collect_read_names_expr(object, out);
+            args.iter().for_each(|a| collect_read_names_expr(a, out));
+        }
+        Expr::Table { fields } => {
+            for f in fields {
+                match f {
+                    TableField::Sequential(e) => collect_read_names_expr(e, out),
+                    TableField::Named(_, e) => collect_read_names_expr(e, out),
+                    TableField::Indexed(k, v) => {
+                        collect_read_names_expr(k, out);
+                        collect_read_names_expr(v, out);
+                    }
+                }
+            }
+        }
+        Expr::Function { body, .. } => body.iter().for_each(|s| collect_read_names(s, out)),
+        Expr::Ternary { cond, then_expr, else_expr } => {
+            collect_read_names_expr(cond, out);
+            collect_read_names_expr(then_expr, out);
+            collect_read_names_expr(else_expr, out);
+        }
+        _ => {}
+    }
+}
+
+/// Collect the names a statement WRITES, mirroring [`stmt_writes_name`].
+fn collect_write_names(stmt: &Stat, out: &mut Vec<String>) {
+    match stmt {
+        Stat::Assign { targets, .. } => {
+            for t in targets {
+                if let Expr::Name(n) = t {
+                    out.push(n.clone());
+                }
+            }
+        }
+        Stat::Local { names, .. } => out.extend(names.iter().cloned()),
+        Stat::If { then_body, elseif_clauses, else_body, .. } => {
+            then_body.iter().for_each(|s| collect_write_names(s, out));
+            for (_, b) in elseif_clauses {
+                b.iter().for_each(|s| collect_write_names(s, out));
+            }
+            if let Some(eb) = else_body {
+                eb.iter().for_each(|s| collect_write_names(s, out));
+            }
+        }
+        Stat::While { body, .. } | Stat::Repeat { body, .. } | Stat::DoBlock { body } => {
+            body.iter().for_each(|s| collect_write_names(s, out))
+        }
+        Stat::NumericFor { body, .. } | Stat::GenericFor { body, .. } => {
+            body.iter().for_each(|s| collect_write_names(s, out))
+        }
+        Stat::LocalFunction { func, .. } | Stat::MethodFunction { func, .. } => {
+            if let Expr::Function { body, .. } = func {
+                body.iter().for_each(|s| collect_write_names(s, out));
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Is there any index strictly after `i` recorded for `name`?
+fn name_used_after(index: &std::collections::HashMap<String, Vec<usize>>, name: &str, i: usize) -> bool {
+    match index.get(name) {
+        Some(v) => v.partition_point(|&j| j <= i) < v.len(),
+        None => false,
+    }
+}
+
 /// Drop `local v_N = { K = "K", ... }` statements whose RHS is a table of
 /// Named(k, String(v)) fields with every k == v, and whose name is never
 /// read afterwards in the current scope (including inside nested closures).
@@ -6236,15 +6663,43 @@ fn eliminate_dead_key_eq_value_locals(stmts: &mut Vec<Stat>) {
         }
     }
 
+    // ── WHY THIS IS INDEXED ─────────────────────────────────────────────────
+    // The shape below asks, per `Stat::Local`, whether its name is read or
+    // written anywhere in the remaining block. Answering that by re-walking
+    // the tail subtree for every local is O(n^2): on the 1.8 MB client chunk
+    // main is ~45,000 statements with thousands of locals, which measured at
+    // over 100 seconds in this pass alone. One walk per statement, recorded
+    // into per-name position lists, answers the same question in a binary
+    // search. Forward order keeps this EXACTLY equivalent: a statement dropped
+    // later always sits at a higher index, and every drop requires
+    // `no_downstream_write`, so nothing removed can change the answer already
+    // given for a lower index.
+    let mut read_index: std::collections::HashMap<String, Vec<usize>> =
+        std::collections::HashMap::new();
+    let mut write_index: std::collections::HashMap<String, Vec<usize>> =
+        std::collections::HashMap::new();
+    {
+        let mut buf: Vec<String> = Vec::new();
+        for (idx, st) in stmts.iter().enumerate() {
+            buf.clear();
+            collect_read_names(st, &mut buf);
+            for n in buf.drain(..) {
+                read_index.entry(n).or_default().push(idx);
+            }
+            collect_write_names(st, &mut buf);
+            for n in buf.drain(..) {
+                write_index.entry(n).or_default().push(idx);
+            }
+        }
+    }
+
+    let mut dropped = vec![false; stmts.len()];
+
     let mut i = 0;
     while i < stmts.len() {
         let drop = if let Stat::Local { names, values } = &stmts[i] {
-            let no_downstream_read = !stmts[i+1..]
-                .iter()
-                .any(|s| stmt_reads_name_deep(s, &names[0]));
-            let no_downstream_write = !stmts[i+1..]
-                .iter()
-                .any(|s| stmt_writes_name(s, &names[0]));
+            let no_downstream_read = !name_used_after(&read_index, &names[0], i);
+            let no_downstream_write = !name_used_after(&write_index, &names[0], i);
             // C10Q: drop `local X = { K = "K", ... }` regardless of the
             // local name as long as it is never read OR reassigned in the
             // remainder of this scope. Every field must be Named(k, "k")
@@ -6296,11 +6751,25 @@ fn eliminate_dead_key_eq_value_locals(stmts: &mut Vec<Stat>) {
             false
         };
         if drop {
-            stmts.remove(i);
-        } else {
-            i += 1;
+            // MARK, DON'T REMOVE.
+            //
+            // `Vec::remove` is O(n) memmove per drop, and `Stat` is a wide
+            // enum. On the 1.8 MB client chunk this pass drops thousands of
+            // artifact locals out of a ~45,000-statement main block, which is
+            // ~10^5 element moves per drop and measured at over 6 minutes here.
+            // Marking keeps the indices the read/write index was built on
+            // valid, and a single compaction at the end costs one pass.
+            dropped[i] = true;
         }
+        i += 1;
     }
+
+    let mut idx = 0;
+    stmts.retain(|_| {
+        let keep = !dropped[idx];
+        idx += 1;
+        keep
+    });
 }
 
 /// C10N: detect RHS of shape `<root>.<method>` or chains rooted at a known
@@ -6689,33 +7158,62 @@ fn eliminate_dead_code(stmts: &mut Vec<Stat>) {
 
     dce_say("after_phase2_truncate", stmts);
     // --- Phase 3: Remove empty if-blocks and empty do-blocks ---
-    let mut i = 0;
-    while i < stmts.len() {
-        // C10i: `if X:method() then end` — keep the call, drop the if-wrap.
-        // Only applies when all branches are empty (so the if is pure wrapping).
-        if let Stat::If { condition, then_body, elseif_clauses, else_body } = &stmts[i] {
-            let all_empty = then_body.is_empty()
-                && elseif_clauses.iter().all(|(_, b)| b.is_empty())
-                && else_body.as_ref().map_or(true, |b| b.is_empty());
-            if all_empty && has_side_effects(condition) {
-                let side = extract_side_effect_stmts(condition);
-                if !side.is_empty() {
-                    stmts.splice(i..=i, side);
-                    continue;
+    //
+    // REBUILT IN ONE PASS, not `remove(i)` in a loop.
+    //
+    // `Vec::remove` inside this loop is O(n) per drop. Main in the 1.8 MB
+    // client chunk is ~45,000 statements and this phase drops thousands of
+    // empty wrappers, so the memmove traffic was quadratic: measured as the
+    // single longest step of the whole decompile (minutes, where every other
+    // pass is milliseconds). Building the surviving block once is O(n).
+    //
+    // The original `continue` after a splice re-examined the statements it had
+    // just inserted. Those come from a condition expression and are not empty
+    // wrappers, so a second round is run only when a splice actually happened,
+    // to keep that behaviour without the index dance.
+    enum Act {
+        Splice(Vec<Stat>),
+        Drop,
+        Keep,
+    }
+    for _round in 0..2 {
+        let mut spliced = false;
+        let mut out: Vec<Stat> = Vec::with_capacity(stmts.len());
+        for stmt in stmts.drain(..) {
+            let act = match &stmt {
+                // C10i: `if X:method() then end` — keep the call, drop the
+                // wrapper. Only when every branch is empty (pure wrapping).
+                Stat::If { condition, then_body, elseif_clauses, else_body }
+                    if then_body.is_empty()
+                        && elseif_clauses.iter().all(|(_, b)| b.is_empty())
+                        && else_body.as_ref().map_or(true, |b| b.is_empty())
+                        && has_side_effects(condition) =>
+                {
+                    let side = extract_side_effect_stmts(condition);
+                    if side.is_empty() {
+                        Act::Keep
+                    } else {
+                        Act::Splice(side)
+                    }
                 }
+                // Empty do-block: `do end`
+                Stat::DoBlock { body } if body.is_empty() => Act::Drop,
+                // Entirely empty if: `if cond then end` (no side effects)
+                s if is_empty_if(s) => Act::Drop,
+                _ => Act::Keep,
+            };
+            match act {
+                Act::Splice(side) => {
+                    out.extend(side);
+                    spliced = true;
+                }
+                Act::Drop => {}
+                Act::Keep => out.push(stmt),
             }
         }
-        let should_remove = match &stmts[i] {
-            // Empty do-block: `do end`
-            Stat::DoBlock { body } if body.is_empty() => true,
-            // Entirely empty if: `if cond then end` (no side effects in cond)
-            stmt if is_empty_if(stmt) => true,
-            _ => false,
-        };
-        if should_remove {
-            stmts.remove(i);
-        } else {
-            i += 1;
+        *stmts = out;
+        if !spliced {
+            break;
         }
     }
 
@@ -6980,36 +7478,46 @@ fn exits_on_all_paths(stmts: &[Stat]) -> bool {
     if stmts.is_empty() {
         return false;
     }
-    // Check if there's a top-level break or return anywhere
-    for (idx, stmt) in stmts.iter().enumerate() {
-        match stmt {
-            Stat::Break | Stat::Return { .. } => return true,
+    // ── LINEAR IN THE BLOCK, NOT EXPONENTIAL ────────────────────────────────
+    //
+    // The rule below has to answer "do the statements from index k onwards
+    // exit?" for every k, because an `if c then break end` with no else falls
+    // through to the rest of the block. Written as a naive recursion — walk
+    // every index, and for each else-less if recurse on the suffix — the same
+    // suffix is re-derived once per preceding if, which is exponential:
+    // measured as a hang of many minutes on a 2,140-statement block of the
+    // client chunk made entirely of `if ... then break end` guards.
+    //
+    // Suffix results depend only on the start index, so they are computed once,
+    // right to left. Semantics are unchanged, including the original quirk that
+    // a bare `break`/`return` ANYWHERE at this level counts as "exits".
+    let n = stmts.len();
+    // suffix[k] == exits_on_all_paths(&stmts[k..]), with suffix[n] == false.
+    let mut suffix = vec![false; n + 1];
+    for k in (0..n).rev() {
+        let here = match &stmts[k] {
+            Stat::Break | Stat::Return { .. } => true,
             Stat::If { then_body, elseif_clauses, else_body, .. } => {
-                // If we have if/elseif/else where ALL branches exit, the whole thing exits
+                // If/elseif/else where ALL branches exit, the whole if exits.
                 let then_exits = exits_on_all_paths(then_body);
                 let elseifs_exit = elseif_clauses.iter().all(|(_, b)| exits_on_all_paths(b));
                 let else_exits = else_body.as_ref().map_or(false, |eb| exits_on_all_paths(eb));
 
                 if then_exits && elseifs_exit && else_exits {
-                    return true;
-                }
-
-                // If this if has a `break` in its then-body and NO else, check if
-                // remaining stmts after this if also exit. This handles:
-                //   if C then break end
-                //   ... more code ...
-                //   break
-                if then_exits && else_body.is_none() && elseif_clauses.is_empty() {
-                    // The "else" path falls through to stmts[idx+1..]
-                    if exits_on_all_paths(&stmts[idx + 1..]) {
-                        return true;
-                    }
+                    true
+                } else if then_exits && else_body.is_none() && elseif_clauses.is_empty() {
+                    // The "else" path falls through to the statements after
+                    // this if, i.e. `stmts[k + 1..]`.
+                    suffix[k + 1]
+                } else {
+                    false
                 }
             }
-            _ => {}
-        }
+            _ => false,
+        };
+        suffix[k] = here || suffix[k + 1];
     }
-    false
+    suffix[0]
 }
 
 /// Check if the body contains a `continue` statement at the current nesting
@@ -11488,7 +11996,8 @@ fn fold_expr(expr: &mut Expr) {
                         BinOp::Sub => Some(Expr::Number(a - b)),
                         BinOp::Mul => Some(Expr::Number(a * b)),
                         BinOp::Div if *b != 0.0 => Some(Expr::Number(a / b)),
-                        BinOp::Mod if *b != 0.0 => Some(Expr::Number(a % b)),
+                        // Floored modulo (see simplify_expr): `-7 % 3 == 2`.
+                        BinOp::Mod if *b != 0.0 => Some(Expr::Number(a - (a / b).floor() * b)),
                         BinOp::Pow => Some(Expr::Number(a.powf(*b))),
                         _ => None,
                     }

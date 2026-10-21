@@ -26,12 +26,13 @@
 //! (e.g. `local Foo = require(...)`), not `local v0 = ...` or `local call0`.
 
 use crate::decompiler::{decompile_proto, DecompileContext};
+use crate::parser::opcodes::LuauOpcode;
 use crate::parser::types::{Chunk, Constant, Proto};
 
-const OP_LOADK: u8     = 5;
-const OP_GETIMPORT: u8 = 12;
-const OP_CALL: u8      = 21;
-const OP_RETURN: u8    = 22;
+const OP_LOADK: u8     = LuauOpcode::LoadK as u8;
+const OP_GETIMPORT: u8 = LuauOpcode::GetImport as u8;
+const OP_CALL: u8      = LuauOpcode::Call as u8;
+const OP_RETURN: u8    = LuauOpcode::Return as u8;
 
 fn insn_ad(op: u8, a: u8, d: i16) -> u32 {
     let du = d as u16 as u32;

@@ -37,6 +37,7 @@
 //!  11. First-write on a fresh register is still FirstDecl.
 
 use super::super::{LocalTracker, WriteKind, is_semantic_local_name};
+use crate::parser::opcodes::LuauOpcode;
 use crate::decompiler::{decompile_proto, DecompileContext};
 use crate::parser::types::{Chunk, Constant, Proto};
 
@@ -47,12 +48,12 @@ use crate::parser::types::{Chunk, Constant, Proto};
 //    `LuauOpcode`).  This means these end-to-end tests now genuinely
 //    exercise the NEWTABLE → seed → SETTABLEKS pipeline, in addition to
 //    the B0.51 "R(b) is Unknown, materialize it" safety net.
-const OP_NEWTABLE: u8   = 53;
-const OP_NEWCLOSURE: u8 = 19;
-const OP_RETURN: u8     = 22;
-const OP_ADDK: u8       = 39;
-const OP_LOADN: u8      = 4;
-const OP_SETTABLEKS: u8 = 16;
+const OP_NEWTABLE: u8   = LuauOpcode::NewTable as u8;
+const OP_NEWCLOSURE: u8 = LuauOpcode::NewClosure as u8;
+const OP_RETURN: u8     = LuauOpcode::Return as u8;
+const OP_ADDK: u8       = LuauOpcode::AddK as u8;
+const OP_LOADN: u8      = LuauOpcode::LoadN as u8;
+const OP_SETTABLEKS: u8 = LuauOpcode::SetTableKS as u8;
 
 fn insn_ad(op: u8, a: u8, d: i16) -> u32 {
     let du = d as u16 as u32;

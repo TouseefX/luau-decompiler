@@ -28,19 +28,20 @@
 //! register held before.
 
 use crate::decompiler::semantic_check::{check, Severity};
+use crate::parser::opcodes::LuauOpcode;
 use crate::decompiler::{decompile_proto, DecompileContext};
 use crate::parser::types::{Chunk, Constant, Proto};
 
 // Canonical Luau opcode bytes (identity opmap, Chunk.version = 6).
-const OP_LOADN: u8 = 4;
-const OP_LOADNIL: u8 = 2;
-const OP_MOVE: u8 = 6;
-const OP_GETGLOBAL: u8 = 7;
-const OP_CALL: u8 = 21;
-const OP_RETURN: u8 = 22;
-const OP_JUMP: u8 = 23;
-const OP_JUMPIF: u8 = 25;
-const OP_JUMPIFNOT: u8 = 26;
+const OP_LOADN: u8 = LuauOpcode::LoadN as u8;
+const OP_LOADNIL: u8 = LuauOpcode::LoadNil as u8;
+const OP_MOVE: u8 = LuauOpcode::Move as u8;
+const OP_GETGLOBAL: u8 = LuauOpcode::GetGlobal as u8;
+const OP_CALL: u8 = LuauOpcode::Call as u8;
+const OP_RETURN: u8 = LuauOpcode::Return as u8;
+const OP_JUMP: u8 = LuauOpcode::Jump as u8;
+const OP_JUMPIF: u8 = LuauOpcode::JumpIf as u8;
+const OP_JUMPIFNOT: u8 = LuauOpcode::JumpIfNot as u8;
 
 fn insn_ad(op: u8, a: u8, d: i16) -> u32 {
     let du = d as u16 as u32;

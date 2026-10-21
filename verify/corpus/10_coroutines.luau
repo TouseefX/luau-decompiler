@@ -1,0 +1,26 @@
+local function gen(n)
+    return coroutine.wrap(function()
+        for i = 1, n do coroutine.yield(i * i) end
+        return "done"
+    end)
+end
+local g = gen(4)
+print(g(), g(), g(), g(), g())
+local co = coroutine.create(function(a, b)
+    local c = coroutine.yield(a + b)
+    local d, e = coroutine.yield(c * 2)
+    return d + e
+end)
+print(coroutine.resume(co, 1, 2))
+print(coroutine.resume(co, 10))
+print(coroutine.resume(co, 5, 6))
+print(coroutine.status(co))
+local ok, err = pcall(function() error("boom") end)
+print(ok, err)
+local ok2, err2 = pcall(function() error({code = 42}) end)
+print(ok2, type(err2), err2.code)
+local ok3, e3 = xpcall(function() error("x") end, function(m) return "handled: " .. m end)
+print(ok3, e3)
+print(pcall(function(a, b) return a + b end, 3, 4))
+local okc, ec = pcall(coroutine.wrap(function() coroutine.yield("yielded") end))
+print(okc, ec)

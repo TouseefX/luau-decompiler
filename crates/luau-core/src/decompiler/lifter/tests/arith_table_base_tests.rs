@@ -28,18 +28,19 @@
 //! decode-artifact garbage B0.59 was written against.
 
 use crate::decompiler::{decompile_proto, DecompileContext};
+use crate::parser::opcodes::LuauOpcode;
 use crate::parser::types::{Chunk, Constant, Proto};
 
 // Canonical Luau opcode bytes (identity opmap, Chunk.version = 6).
-const OP_LOADNIL: u8 = 2;
-const OP_LOADN: u8 = 4;
-const OP_GETTABLEKS: u8 = 15;
-const OP_RETURN: u8 = 22;
-const OP_ADD: u8 = 33;
-const OP_SUB: u8 = 34;
-const OP_MUL: u8 = 35;
-const OP_DIV: u8 = 36;
-const OP_CONCAT: u8 = 49;
+const OP_LOADNIL: u8 = LuauOpcode::LoadNil as u8;
+const OP_LOADN: u8 = LuauOpcode::LoadN as u8;
+const OP_GETTABLEKS: u8 = LuauOpcode::GetTableKS as u8;
+const OP_RETURN: u8 = LuauOpcode::Return as u8;
+const OP_ADD: u8 = LuauOpcode::Add as u8;
+const OP_SUB: u8 = LuauOpcode::Sub as u8;
+const OP_MUL: u8 = LuauOpcode::Mul as u8;
+const OP_DIV: u8 = LuauOpcode::Div as u8;
+const OP_CONCAT: u8 = LuauOpcode::Concat as u8;
 
 fn insn_ad(op: u8, a: u8, d: i16) -> u32 {
     let du = d as u16 as u32;

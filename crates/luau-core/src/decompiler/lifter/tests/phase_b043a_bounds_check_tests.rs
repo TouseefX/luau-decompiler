@@ -23,16 +23,17 @@
 //! cannot be read (all instructions pruned) to confirm no `.unwrap()`
 //! fires in the edge-connection pass.
 use crate::ast::Expr;
+use crate::parser::opcodes::LuauOpcode;
 use crate::decompiler::{decompile_proto, DecompileContext};
 use crate::parser::types::{Chunk, Constant, Proto};
 use super::super::get_const_expr;
 
 // Canonical (non-shuffled) Luau v6 opcode bytes.
-const OP_LOADK: u8   = 3;
-const OP_LOADKX: u8  = 66;
-const OP_LOADN: u8   = 4;
-const OP_RETURN: u8  = 22;
-const OP_NEWCLOSURE: u8 = 19;
+const OP_LOADK: u8   = LuauOpcode::LoadK as u8;
+const OP_LOADKX: u8  = LuauOpcode::LoadKX as u8;
+const OP_LOADN: u8   = LuauOpcode::LoadN as u8;
+const OP_RETURN: u8  = LuauOpcode::Return as u8;
+const OP_NEWCLOSURE: u8 = LuauOpcode::NewClosure as u8;
 
 fn insn_ad(op: u8, a: u8, d: i16) -> u32 {
     let du = d as u16 as u32;

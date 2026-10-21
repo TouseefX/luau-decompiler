@@ -112,6 +112,17 @@ impl ControlFlowGraph {
                                 )
                             },
                         );
+                    if std::env::var("LUAU_CFG_DEBUG").is_ok() {
+                        eprintln!(
+                            "CFGJUMP pc={} op={:?} keep_whole={} boolidiom={} orchain={:?}",
+                            pc,
+                            op,
+                            keep_whole,
+                            crate::analysis::bool_idiom::recognize_bool_idiom(code, pc).is_some(),
+                            crate::analysis::bool_idiom::recognize_or_and_chain(code, pc)
+                                .map(|c| (c.end_pc, crate::analysis::bool_idiom::span_has_external_entry(code, pc, c.end_pc)))
+                        );
+                    }
                     if keep_whole {
                         pc = next_pc;
                         continue;
@@ -294,6 +305,22 @@ impl ControlFlowGraph {
                 // prefer a graceful fallback over `.unwrap()` for robustness.
                 if let Some(b) = blocks.get_mut(&succ) {
                     b.predecessors.push(start);
+                }
+            }
+        }
+
+        if let Ok(rng) = std::env::var("LUAU_CFG_BLOCKS") {
+            if let Some((a, b)) = rng.split_once("..") {
+                if let (Ok(lo), Ok(hi)) = (a.parse::<usize>(), b.parse::<usize>()) {
+                    eprintln!("BLOCKS total={}", blocks.len());
+                    for (bid, blk) in &blocks {
+                        if blk.end >= lo && blk.start <= hi {
+                            eprintln!(
+                                "BLOCK id={} {}..{} succ={:?} branch_pc={:?}",
+                                bid, blk.start, blk.end, blk.successors, blk.branch_pc
+                            );
+                        }
+                    }
                 }
             }
         }

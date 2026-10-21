@@ -74,3 +74,8 @@ local_mem/
 /*.tsv
 /*.bat
 /audit_report.md
+
+# round-trip harness output
+out-verify/
+verify/luacrun
+verify/out*/

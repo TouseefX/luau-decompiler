@@ -146,23 +146,29 @@ pub enum LuauOpcode {
     ForNLoop = 57,
 
     // ── Generic for loop ──
-    /// A: iterator state register; D: jump offset
-    ForGPrep = 58,
+    // NOTE: these numbers are the CANONICAL Luau / Roblox ones (matching
+    // Luau's Common/include/Luau/Bytecode.h and the disassembled Roblox
+    // BytecodeBuilder.c). They were previously shifted from 58 upward, which
+    // mis-decoded every generic-for, vararg, closure, integer-division and
+    // FASTCALL3 instruction in real chunks (a live client script decoded
+    // FORGLOOP as FORGPREP and FORGPREP as IDIV).
     /// A: iterator state register; D: jump offset; AUX: loop variable count
-    ForGLoop = 59,
+    ForGLoop = 58,
     /// A: iterator register; D: jump offset (for inext specialization)
-    ForGPrepINext = 60,
-    /// Deprecated (was ForGLoopINext). AD format, no AUX. Still participates in Roblox opcode shuffle.
-    Deprecated61 = 61,
+    ForGPrepINext = 59,
+    /// A: builtin id; B: arg1 register; C: jump offset; AUX: arg2 + arg3 packed
+    FastCall3 = 60,
     /// A: iterator register; D: jump offset (for next specialization)
-    ForGPrepNext = 62,
+    ForGPrepNext = 61,
 
     // ── Native code hint ──
-    NativeCall = 63,
+    NativeCall = 62,
 
     // ── Varargs ──
     /// A: target register; B: count + 1 (0=all)
-    GetVarargs = 64,
+    GetVarargs = 63,
+    /// A: target; D: constant index (closure) — DUPCLOSURE
+    DupClosure = 64,
     /// A: number of fixed params
     PrepVarargs = 65,
 
@@ -193,99 +199,82 @@ pub enum LuauOpcode {
     /// A: builtin id; B: arg register; C: jump offset; AUX: constant index
     FastCall2K = 75,
 
-    // ── v4+: Integer division ──
-    /// A: target; B: left; C: right
-    IDiv = 76,
-    /// A: target; B: left; C: constant index
-    IDivK = 77,
+    /// A: iterator state register; D: jump offset
+    ForGPrep = 76,
 
-    // ── Extended comparison jumps (v3+) ──
+    // ── Extended comparison jumps ──
     /// A: register; D: jump offset; AUX: nil comparison
-    JumpXEqKNil = 78,
+    JumpXEqKNil = 77,
     /// A: register; D: jump offset; AUX: boolean constant
-    JumpXEqKB = 79,
+    JumpXEqKB = 78,
     /// A: register; D: jump offset; AUX: number constant index
-    JumpXEqKN = 80,
+    JumpXEqKN = 79,
     /// A: register; D: jump offset; AUX: string constant index
-    JumpXEqKS = 81,
+    JumpXEqKS = 80,
 
-    // ── v5+: Closure duplication ──
-    /// A: target; D: constant index (closure)
-    DupClosure = 82,
+    // ── Integer division ──
+    /// A: target; B: left; C: right
+    IDiv = 81,
+    /// A: target; B: left; C: constant index
+    IDivK = 82,
 
-    // ── v6+: Three-arg fastcall ──
-    /// A: builtin id; B: arg1 register; C: jump offset; AUX: arg2 + arg3 packed
-    FastCall3 = 83,
+    // ── Luau classes / typed userdata (83-92) ──
+    // Present in the canonical numbering. The lifter does not model their
+    // semantics; they decode to themselves so the instruction stream stays
+    // aligned (all of them carry an AUX word, see `has_aux`).
+    GetUdataKS = 83,
+    SetUdataKS = 84,
+    NameCallUdata = 85,
+    NewClassMember = 86,
+    /// CALLFB — a plain CALL (same A/B/C operands) followed by one
+    /// feedback-slot AUX word. `remap_chunk` normalises it to a bare CALL and
+    /// neutralises the feedback word to a NOP, so every jump offset survives.
+    CallFb = 87,
+    CmpProto = 88,
+    FastPCall = 89,
+    NewClass = 90,
+    Construct = 91,
+    FinConstruct = 92,
 
-    // ── Roblox-specific extensions: native bitwise operators (Roblox Luau v4+) ──
-    // These opcodes are Roblox additions beyond open-source Luau canonical 83.
-    // All use ABC format (A=dest, B=left, C=right register OR constant index).
-    // No AUX word — single-word instructions.
-    /// A: target; B: left register; C: right register  →  R(A) = R(B) & R(C)
-    Band = 84,
-    /// A: target; B: left register; C: right register  →  R(A) = R(B) | R(C)
-    Bor = 85,
-    /// A: target; B: left register; C: right register  →  R(A) = R(B) ~ R(C) (XOR)
-    Bxor = 86,
-    /// A: target; B: source register; C: unused (0)   →  R(A) = ~R(B)
-    Bnot = 87,
-    /// A: target; B: left register; C: right register  →  R(A) = R(B) << R(C)
-    Shl = 88,
-    /// A: target; B: left register; C: right register  →  R(A) = R(B) >> R(C)
-    Shr = 89,
-    /// A: target; B: left register; C: constant index  →  R(A) = R(B) & K(C)
-    Bandk = 90,
-    /// A: target; B: left register; C: constant index  →  R(A) = R(B) | K(C)
-    Bork = 91,
-
-    // ── Roblox-specific extensions beyond canonical 91 ──
-    // Exact semantics unknown; unary shape (A=dst, B=src, C=0) confirmed from corpus.
-    // Emitted as placeholder calls in the decompiler output.
-    /// A: target; B: source; C: 0  — Roblox extension, unary, exact op unknown
-    RbxExt92 = 92,
-    /// A: target; B: source; C: 0  — Roblox extension, unary, exact op unknown
-    RbxExt93 = 93,
-    /// A: target; B: source; C: 0  — Roblox extension, unary, exact op unknown
-    RbxExt94 = 94,
-    /// A: target; B: left; C: right  — Roblox extension, binary, exact op unknown
-    RbxExt95 = 95,
-    /// A: target; B: source; C: 0  — Roblox extension, unary, exact op unknown
-    RbxExt96 = 96,
-    /// A: target; B: source; C: 0  — Roblox extension, unary, exact op unknown
-    RbxExt97 = 97,
-    /// A: target; B: source; C: 0  — Roblox extension, unary, exact op unknown
-    RbxExt98 = 98,
-    /// A: target; B: left; C: right  — Roblox extension, binary, exact op unknown
-    RbxExt99 = 99,
-    /// A: target; B: left; C: right  — Roblox extension, binary, exact op unknown
-    RbxExt100 = 100,
-    /// A: target; B: left; C: right  — Roblox extension, binary, exact op unknown
-    RbxExt101 = 101,
-    /// A: target; B: left; C: right  — Roblox extension, binary, exact op unknown
-    RbxExt102 = 102,
-    /// A: target; B: left; C: right  — Roblox extension, binary, exact op unknown
-    RbxExt103 = 103,
-    /// A: target; B: left; C: right  — Roblox extension, binary, exact op unknown
-    RbxExt104 = 104,
-    /// A: target; B: left; C: right  — Roblox extension, binary, exact op unknown
-    RbxExt105 = 105,
-
-    /// CALLFB — Roblox v11+ call-feedback opcode: a plain CALL (same A/B/C
-    /// operands) followed by one feedback-slot AUX word. The live v12 client
-    /// emits it in place of CALL wherever call feedback is on. It carries an
-    /// AUX word (see `has_aux`); `remap_chunk` normalises it to a bare CALL and
-    /// neutralises the feedback word to a NOP, so the lifter sees ordinary CALL
-    /// semantics with every jump offset preserved.
-    CallFb = 106,
+    // ── Legacy placeholders ────────────────────────────────────────────────
+    // These names are retained because detector/heuristic code still refers to
+    // them, but they are NOT part of canonical Roblox bytecode: the client's
+    // numbering has no native bitwise opcodes (bit32 is a library) and no
+    // "RBX extension" opcodes. They are parked outside the real byte range so
+    // no byte in a real chunk can ever decode to one.
+    Deprecated61 = 130,
+    /// A: target; B: left; C: right  — NOT a Roblox opcode
+    Band = 140,
+    Bor = 141,
+    Bxor = 142,
+    Bnot = 143,
+    Shl = 144,
+    Shr = 145,
+    Bandk = 146,
+    Bork = 147,
+    RbxExt92 = 200,
+    RbxExt93 = 201,
+    RbxExt94 = 202,
+    RbxExt95 = 203,
+    RbxExt96 = 204,
+    RbxExt97 = 205,
+    RbxExt98 = 206,
+    RbxExt99 = 207,
+    RbxExt100 = 208,
+    RbxExt101 = 209,
+    RbxExt102 = 210,
+    RbxExt103 = 211,
+    RbxExt104 = 212,
+    RbxExt105 = 213,
 
     // Unknown opcode
     Unknown = 255,
 }
 
 impl LuauOpcode {
-    /// One past the highest valid canonical opcode number (exclusive upper bound).
-    /// Includes Roblox-specific extensions 92-99 and CALLFB (106).
-    pub const MAX_OPCODE: usize = 107;
+    /// One past the highest opcode number this enum can produce (exclusive).
+    /// The real byte range is 0..=92; the legacy placeholders live at 130..=213.
+    pub const MAX_OPCODE: usize = 256;
 
     pub fn from_u8(val: u8) -> Self {
         match val {
@@ -347,13 +336,13 @@ impl LuauOpcode {
             55 => Self::SetList,
             56 => Self::ForNPrep,
             57 => Self::ForNLoop,
-            58 => Self::ForGPrep,
-            59 => Self::ForGLoop,
-            60 => Self::ForGPrepINext,
-            61 => Self::Deprecated61,
-            62 => Self::ForGPrepNext,
-            63 => Self::NativeCall,
-            64 => Self::GetVarargs,
+            58 => Self::ForGLoop,
+            59 => Self::ForGPrepINext,
+            60 => Self::FastCall3,
+            61 => Self::ForGPrepNext,
+            62 => Self::NativeCall,
+            63 => Self::GetVarargs,
+            64 => Self::DupClosure,
             65 => Self::PrepVarargs,
             66 => Self::LoadKX,
             67 => Self::JumpX,
@@ -365,37 +354,47 @@ impl LuauOpcode {
             73 => Self::FastCall1,
             74 => Self::FastCall2,
             75 => Self::FastCall2K,
-            76 => Self::IDiv,
-            77 => Self::IDivK,
-            78 => Self::JumpXEqKNil,
-            79 => Self::JumpXEqKB,
-            80 => Self::JumpXEqKN,
-            81 => Self::JumpXEqKS,
-            82 => Self::DupClosure,
-            83 => Self::FastCall3,
+            76 => Self::ForGPrep,
+            77 => Self::JumpXEqKNil,
+            78 => Self::JumpXEqKB,
+            79 => Self::JumpXEqKN,
+            80 => Self::JumpXEqKS,
+            81 => Self::IDiv,
+            82 => Self::IDivK,
+            83 => Self::GetUdataKS,
+            84 => Self::SetUdataKS,
+            85 => Self::NameCallUdata,
+            86 => Self::NewClassMember,
+            87 => Self::CallFb,
+            88 => Self::CmpProto,
+            89 => Self::FastPCall,
+            90 => Self::NewClass,
+            91 => Self::Construct,
+            92 => Self::FinConstruct,
             106 => Self::CallFb,
-            84 => Self::Band,
-            85 => Self::Bor,
-            86 => Self::Bxor,
-            87 => Self::Bnot,
-            88 => Self::Shl,
-            89 => Self::Shr,
-            90 => Self::Bandk,
-            91 => Self::Bork,
-            92 => Self::RbxExt92,
-            93 => Self::RbxExt93,
-            94 => Self::RbxExt94,
-            95 => Self::RbxExt95,
-            96 => Self::RbxExt96,
-            97 => Self::RbxExt97,
-            98 => Self::RbxExt98,
-            99 => Self::RbxExt99,
-            100 => Self::RbxExt100,
-            101 => Self::RbxExt101,
-            102 => Self::RbxExt102,
-            103 => Self::RbxExt103,
-            104 => Self::RbxExt104,
-            105 => Self::RbxExt105,
+            130 => Self::Deprecated61,
+            140 => Self::Band,
+            141 => Self::Bor,
+            142 => Self::Bxor,
+            143 => Self::Bnot,
+            144 => Self::Shl,
+            145 => Self::Shr,
+            146 => Self::Bandk,
+            147 => Self::Bork,
+            200 => Self::RbxExt92,
+            201 => Self::RbxExt93,
+            202 => Self::RbxExt94,
+            203 => Self::RbxExt95,
+            204 => Self::RbxExt96,
+            205 => Self::RbxExt97,
+            206 => Self::RbxExt98,
+            207 => Self::RbxExt99,
+            208 => Self::RbxExt100,
+            209 => Self::RbxExt101,
+            210 => Self::RbxExt102,
+            211 => Self::RbxExt103,
+            212 => Self::RbxExt104,
+            213 => Self::RbxExt105,
             _ => Self::Unknown,
         }
     }
@@ -488,6 +487,15 @@ impl LuauOpcode {
             Self::DupClosure => "DUPCLOSURE",
             Self::FastCall3 => "FASTCALL3",
             Self::CallFb => "CALLFB",
+            Self::GetUdataKS => "GETUDATAKS",
+            Self::SetUdataKS => "SETUDATAKS",
+            Self::NameCallUdata => "NAMECALLUDATA",
+            Self::NewClassMember => "NEWCLASSMEMBER",
+            Self::CmpProto => "CMPPROTO",
+            Self::FastPCall => "FASTPCALL",
+            Self::NewClass => "NEWCLASS",
+            Self::Construct => "CONSTRUCT",
+            Self::FinConstruct => "FINCONSTRUCT",
             Self::Band => "BAND",
             Self::Bor => "BOR",
             Self::Bxor => "BXOR",
@@ -543,6 +551,16 @@ impl LuauOpcode {
                 | Self::NameCall
                 // CALLFB carries one feedback-slot AUX word after the CALL word.
                 | Self::CallFb
+                // Luau classes / typed userdata: every one of these carries an
+                // AUX word per upstream getOpLength(). Decoding them without
+                // skipping the AUX desyncs the whole instruction stream.
+                | Self::GetUdataKS
+                | Self::SetUdataKS
+                | Self::NameCallUdata
+                | Self::NewClassMember
+                | Self::CmpProto
+                | Self::NewClass
+                | Self::Construct
                 // Roblox extension: RBX_EXT_101 is observed to have an AUX word
                 // (confirmed via debug-disasm: UNKNOWN 0x00000800 always follows it).
                 | Self::RbxExt101
