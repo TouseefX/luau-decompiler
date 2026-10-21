@@ -27,15 +27,16 @@
 //! GETUPVAL into a previously-declared scratch register is normal bytecode.
 
 use crate::decompiler::{decompile_proto, DecompileContext};
+use crate::parser::opcodes::LuauOpcode;
 use crate::parser::types::{Chunk, Constant, Proto};
 
-const OP_LOADB: u8      = 3;
-const OP_GETUPVAL: u8   = 9;
-const OP_SETUPVAL: u8   = 10;
-const OP_GETTABLEKS: u8 = 15;
-const OP_CALL: u8       = 21;
-const OP_RETURN: u8     = 22;
-const OP_JUMPIFLE: u8   = 28;
+const OP_LOADB: u8      = LuauOpcode::LoadB as u8;
+const OP_GETUPVAL: u8   = LuauOpcode::GetUpval as u8;
+const OP_SETUPVAL: u8   = LuauOpcode::SetUpval as u8;
+const OP_GETTABLEKS: u8 = LuauOpcode::GetTableKS as u8;
+const OP_CALL: u8       = LuauOpcode::Call as u8;
+const OP_RETURN: u8     = LuauOpcode::Return as u8;
+const OP_JUMPIFLE: u8   = LuauOpcode::JumpIfLE as u8;
 
 fn insn_ad(op: u8, a: u8, d: i16) -> u32 {
     let du = d as u16 as u32;

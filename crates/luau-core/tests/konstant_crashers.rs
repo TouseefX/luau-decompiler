@@ -44,25 +44,26 @@
 //! CI while the regressions remain visible.
 
 use luau_core::decompiler::{decompile_proto, DecompileContext};
+use luau_core::parser::opcodes::LuauOpcode;
 use luau_core::parser::types::{Chunk, Constant, Proto};
 
 // ── Canonical opcode byte constants (mirror `LuauOpcode as u8`) ────────────
-const OP_LOADN: u8        = 4;
-const OP_GETUPVAL: u8     = 9;
-const OP_GETTABLEKS: u8   = 15;
-const OP_SETTABLEKS: u8   = 16;
-const OP_NEWCLOSURE: u8   = 19;
-const OP_CALL: u8         = 21;
-const OP_RETURN: u8       = 22;
-const OP_JUMP: u8         = 23;
-const OP_JUMPBACK: u8     = 24;
-const OP_ADD: u8          = 33;
-const OP_MULK: u8         = 41;
-const OP_DIVK: u8         = 42;
-const OP_NEWTABLE: u8     = 53;
-const OP_FORNPREP: u8     = 56;
-const OP_FORNLOOP: u8     = 57;
-const OP_CAPTURE: u8      = 70;
+const OP_LOADN: u8        = LuauOpcode::LoadN as u8;
+const OP_GETUPVAL: u8     = LuauOpcode::GetUpval as u8;
+const OP_GETTABLEKS: u8   = LuauOpcode::GetTableKS as u8;
+const OP_SETTABLEKS: u8   = LuauOpcode::SetTableKS as u8;
+const OP_NEWCLOSURE: u8   = LuauOpcode::NewClosure as u8;
+const OP_CALL: u8         = LuauOpcode::Call as u8;
+const OP_RETURN: u8       = LuauOpcode::Return as u8;
+const OP_JUMP: u8         = LuauOpcode::Jump as u8;
+const OP_JUMPBACK: u8     = LuauOpcode::JumpBack as u8;
+const OP_ADD: u8          = LuauOpcode::Add as u8;
+const OP_MULK: u8         = LuauOpcode::MulK as u8;
+const OP_DIVK: u8         = LuauOpcode::DivK as u8;
+const OP_NEWTABLE: u8     = LuauOpcode::NewTable as u8;
+const OP_FORNPREP: u8     = LuauOpcode::ForNPrep as u8;
+const OP_FORNLOOP: u8     = LuauOpcode::ForNLoop as u8;
+const OP_CAPTURE: u8      = LuauOpcode::Capture as u8;
 
 // ── Instruction encoding helpers ───────────────────────────────────────────
 

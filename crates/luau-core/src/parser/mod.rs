@@ -4,6 +4,7 @@ pub mod fingerprint;
 pub mod ground_truth;
 pub mod known_shuffles;
 pub mod opcodes;
+pub mod opkey;
 pub mod opmap;
 pub mod opmap_db;
 pub mod probe;

@@ -18,15 +18,16 @@
 //!     global), yet the same shadow guard dropped it to `upval_5`.
 
 use crate::decompiler::{decompile_proto, DecompileContext};
+use crate::parser::opcodes::LuauOpcode;
 use crate::parser::types::{Chunk, Constant, Proto};
 
 // Canonical Luau opcode bytes (identity opmap, Chunk.version = 6).
-const OP_GETGLOBAL: u8 = 7;
-const OP_GETUPVAL: u8 = 9;
-const OP_NEWCLOSURE: u8 = 19;
-const OP_RETURN: u8 = 22;
-const OP_CLOSEUPVALS: u8 = 11;
-const OP_CAPTURE: u8 = 70;
+const OP_GETGLOBAL: u8 = LuauOpcode::GetGlobal as u8;
+const OP_GETUPVAL: u8 = LuauOpcode::GetUpval as u8;
+const OP_NEWCLOSURE: u8 = LuauOpcode::NewClosure as u8;
+const OP_RETURN: u8 = LuauOpcode::Return as u8;
+const OP_CLOSEUPVALS: u8 = LuauOpcode::CloseUpvals as u8;
+const OP_CAPTURE: u8 = LuauOpcode::Capture as u8;
 
 fn insn_ad(op: u8, a: u8, d: i16) -> u32 {
     let du = d as u16 as u32;

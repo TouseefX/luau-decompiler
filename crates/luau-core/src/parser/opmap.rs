@@ -543,37 +543,37 @@ impl OpcodeMap {
     }
 
     /// Translate a *canonical* (upstream open-source Luau) opcode number into
-    /// this decompiler's internal (Roblox-layout) opcode number, or 255 if the
-    /// byte has no canonical Luau meaning in the range this build understands.
+    /// this decompiler's internal opcode number.
     ///
-    /// The upstream `luau-compile` toolchain emits canonical Luau opcode
-    /// numbers with NO per-client shuffle. That canonical numbering is identical
-    /// to the Roblox layout for opcodes 0..=57 and 65..=75, but diverges in the
-    /// 58..=64 and 76..=82 ranges (generic-for, native call, varargs, closure
-    /// duplication, three-arg fastcall, jump-eq-constant and integer division).
-    /// Each mapping below is by opcode *identity* (same instruction, different
-    /// number) and was verified against bytecode produced by `luau-compile`.
+    /// This used to be a non-identity table, because the internal numbering had
+    /// drifted from upstream in the 58..=82 range (generic-for, native call,
+    /// varargs, closure duplication, FASTCALL3, jump-eq-constant, integer
+    /// division). That drift was wrong: the live Roblox client uses the SAME
+    /// numbering as upstream Luau — verified against the disassembled client
+    /// `BytecodeBuilder` and against a 1.8 MB live-clientscript chunk, where the
+    /// canonical table decodes 1610/1610 protos with a clean op-length chain.
+    ///
+    /// The internal table is now that canonical numbering, so canonical bytes
+    /// pass through unchanged. The function is kept (rather than deleted) as the
+    /// single place that documents the claim.
     pub(crate) const fn canonical_luau_to_internal(op: u8) -> u8 {
-        match op {
-            // Identical numbering in both layouts.
-            0..=57 => op,
-            58 => 59,  // FORGLOOP        -> ForGLoop
-            59 => 60,  // FORGPREP_INEXT  -> ForGPrepINext
-            60 => 83,  // FASTCALL3       -> FastCall3
-            61 => 62,  // FORGPREP_NEXT   -> ForGPrepNext
-            62 => 63,  // NATIVECALL      -> NativeCall
-            63 => 64,  // GETVARARGS      -> GetVarargs
-            64 => 82,  // DUPCLOSURE      -> DupClosure
-            // Identical numbering in both layouts.
-            65..=75 => op,
-            76 => 58,  // FORGPREP        -> ForGPrep
-            77 => 78,  // JUMPXEQKNIL     -> JumpXEqKNil
-            78 => 79,  // JUMPXEQKB       -> JumpXEqKB
-            79 => 80,  // JUMPXEQKN       -> JumpXEqKN
-            80 => 81,  // JUMPXEQKS       -> JumpXEqKS
-            81 => 76,  // IDIV            -> IDiv
-            82 => 77,  // IDIVK           -> IDivK
-            _ => 255,  // 83+ has no canonical meaning this build decodes.
+        // IDENTITY FOR 0..=82, REJECT THE REST.
+        //
+        // Upstream Luau's `enum LuauOpcode` and this crate's numbering agree
+        // word for word over the whole canonical range — verified against
+        // `Common/include/Luau/Bytecode.h` and against the Roblox builder, and
+        // confirmed by measurement on a real client chunk. So the translation
+        // is the identity. It is NOT the identity above 82: canonical Luau has
+        // exactly 83 opcodes, and bytes 83+ in this crate's table are the
+        // Roblox-only extensions (GETUDATAKS, NEWCLASS, CALLFB, ...). Mapping
+        // 83 through as if it were canonical would claim a canonical meaning
+        // for a byte the canonical format cannot produce, and would make
+        // `canonical_opcode_name(83)` answer with an opcode name instead of
+        // declining the question.
+        if op <= 82 {
+            op
+        } else {
+            255
         }
     }
 

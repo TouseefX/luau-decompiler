@@ -28,16 +28,17 @@
 //!  10. Regression guard: SETTABLEN on an unwritten register also seeds.
 
 use super::super::{LocalTracker, WriteKind};
+use crate::parser::opcodes::LuauOpcode;
 use crate::decompiler::{decompile_proto, DecompileContext};
 use crate::parser::types::{Chunk, Constant, Proto};
 
 // ── Canonical Luau v6 opcode bytes (real values from LuauOpcode enum)
-const OP_LOADN: u8       = 4;
-const OP_SETTABLEKS: u8  = 16;
-const OP_SETTABLEN: u8   = 18;
-const OP_NEWCLOSURE: u8  = 19;
-const OP_RETURN: u8      = 22;
-const OP_NEWTABLE: u8    = 53;
+const OP_LOADN: u8       = LuauOpcode::LoadN as u8;
+const OP_SETTABLEKS: u8  = LuauOpcode::SetTableKS as u8;
+const OP_SETTABLEN: u8   = LuauOpcode::SetTableN as u8;
+const OP_NEWCLOSURE: u8  = LuauOpcode::NewClosure as u8;
+const OP_RETURN: u8      = LuauOpcode::Return as u8;
+const OP_NEWTABLE: u8    = LuauOpcode::NewTable as u8;
 
 fn insn_ad(op: u8, a: u8, d: i16) -> u32 {
     let du = d as u16 as u32;

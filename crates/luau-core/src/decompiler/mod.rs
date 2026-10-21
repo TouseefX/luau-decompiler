@@ -2055,7 +2055,61 @@ fn get_aux_string(proto: &Proto, strings: &[String], aux: u32) -> Option<String>
 }
 
 /// Decompile a single proto into Luau source
+thread_local! {
+    /// Every proto index that reached the emitter, and every one that did not.
+    ///
+    /// "No dropped bodies" is an acceptance criterion, and it is not
+    /// observable from the output alone: a missing function leaves no dangling
+    /// name and no syntax error, so the source looks fine while a whole body is
+    /// absent. Counting what was emitted against what the chunk contains is the
+    /// only check that sees it. Set `LUAU_PROTO_COVERAGE` to print the verdict,
+    /// or call `proto_coverage()` to assert on it.
+    static EMITTED: std::cell::RefCell<std::collections::BTreeSet<usize>> =
+        const { std::cell::RefCell::new(std::collections::BTreeSet::new()) };
+}
+
+/// Reset per chunk (same reason as `call_recovery::reset`).
+pub fn reset_proto_coverage() {
+    EMITTED.with(|e| e.borrow_mut().clear());
+}
+
+/// (emitted proto indices, sorted) — the caller supplies `total` to diff.
+pub fn proto_coverage() -> Vec<usize> {
+    EMITTED.with(|e| e.borrow().iter().copied().collect())
+}
+
+thread_local! {
+    /// Name of the proto currently lifting, for env-gated traces.
+    static CURRENT_PROTO: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+}
+
+/// Set at the top of each proto lift; read by diagnostics that have no `&Proto`.
+pub fn set_current_proto_name(name: &str) {
+    CURRENT_PROTO.with(|c| {
+        let mut b = c.borrow_mut();
+        b.clear();
+        b.push_str(name);
+    });
+}
+
+/// The proto currently lifting, for traces.
+pub fn current_proto_name() -> String {
+    CURRENT_PROTO.with(|c| c.borrow().clone())
+}
+
+/// Record that `proto_index` reached the lifter (called from `lift_proto_inner`,
+/// which is the single funnel for both top-level and nested closures).
+pub fn note_proto_emitted(proto_index: usize) {
+    if std::env::var("LUAU_PROTO_TRACE").is_ok() {
+        eprintln!("LIFT proto={}", proto_index);
+    }
+    EMITTED.with(|e| {
+        e.borrow_mut().insert(proto_index);
+    });
+}
+
 pub fn decompile_proto(ctx: &mut DecompileContext, proto: &Proto, proto_index: usize, depth: usize) -> String {
+    note_proto_emitted(proto_index);
     let mut stmts = lifter::lift_proto(ctx, proto, proto_index);
 
     // Declare captured upvalues that no scope declares.
@@ -2071,7 +2125,9 @@ pub fn decompile_proto(ctx: &mut DecompileContext, proto: &Proto, proto_index: u
     // capture may be written in one closure and read by another that runs
     // first, so declaring at first use would not be sound.
     if depth == 0 {
-        let declared = free_var_decls::declare_free_vars(&mut stmts);
+        let declared = crate::decompiler::lifter::timed("declare_free_vars", || {
+            free_var_decls::declare_free_vars(&mut stmts)
+        });
         if !declared.is_empty() {
             log::debug!(
                 "declared {} captured upvalue(s) with no binding: {}",
@@ -2082,7 +2138,7 @@ pub fn decompile_proto(ctx: &mut DecompileContext, proto: &Proto, proto_index: u
     }
 
     let mut output = String::new();
-    emit::emit_block(&mut output, &stmts, depth);
+    crate::decompiler::lifter::timed("emit_block", || emit::emit_block(&mut output, &stmts, depth));
     output
 }
 
@@ -2199,25 +2255,26 @@ mod hint_path_tests {
         is_valid_luau_identifier, RegisterHint,
     };
     use crate::parser::types::{Constant, Proto};
+    use crate::parser::opcodes::LuauOpcode;
 
     // Canonical (non-shuffled) Luau v6 opcode bytes used in the tests.
-    const OP_LOADN: u8      = 4;
-    const OP_GETGLOBAL: u8  = 7;
-    const OP_GETUPVAL: u8   = 9;
-    const OP_GETIMPORT: u8  = 12;
-    const OP_GETTABLEKS: u8 = 15;
-    const OP_CALL: u8       = 21;
-    const OP_RETURN: u8     = 22;
-    const OP_NEWCLOSURE: u8 = 19;
-    const OP_DUPCLOSURE: u8 = 82;
+    const OP_LOADN: u8      = LuauOpcode::LoadN as u8;
+    const OP_GETGLOBAL: u8  = LuauOpcode::GetGlobal as u8;
+    const OP_GETUPVAL: u8   = LuauOpcode::GetUpval as u8;
+    const OP_GETIMPORT: u8  = LuauOpcode::GetImport as u8;
+    const OP_GETTABLEKS: u8 = LuauOpcode::GetTableKS as u8;
+    const OP_CALL: u8       = LuauOpcode::Call as u8;
+    const OP_RETURN: u8     = LuauOpcode::Return as u8;
+    const OP_NEWCLOSURE: u8 = LuauOpcode::NewClosure as u8;
+    const OP_DUPCLOSURE: u8 = LuauOpcode::DupClosure as u8;
     // Phase B0.43C — arithmetic opcodes for binary-op LHS propagation tests.
-    const OP_ADD: u8        = 33;
-    const OP_SUB: u8        = 34;
-    const OP_MUL: u8        = 35;
-    const OP_DIV: u8        = 36;
-    const OP_MOD: u8        = 37;
-    const OP_POW: u8        = 38;
-    const OP_ADDK: u8       = 39;
+    const OP_ADD: u8        = LuauOpcode::Add as u8;
+    const OP_SUB: u8        = LuauOpcode::Sub as u8;
+    const OP_MUL: u8        = LuauOpcode::Mul as u8;
+    const OP_DIV: u8        = LuauOpcode::Div as u8;
+    const OP_MOD: u8        = LuauOpcode::Mod as u8;
+    const OP_POW: u8        = LuauOpcode::Pow as u8;
+    const OP_ADDK: u8       = LuauOpcode::AddK as u8;
 
     fn insn_ad(op: u8, a: u8, d: i16) -> u32 {
         let du = d as u16 as u32;
@@ -3063,7 +3120,7 @@ mod hint_path_tests {
         // R1..R4 should all carry `Named("counter")`.
         const OP_MUL_L: u8 = OP_MUL;
         const OP_DIV_L: u8 = OP_DIV;
-        const OP_IDIV: u8  = 76;
+        const OP_IDIV: u8  = LuauOpcode::IDiv as u8;
         let code = vec![
             insn_abc(OP_GETGLOBAL, 0, 0, 0),
             0u32,
@@ -3260,10 +3317,10 @@ mod hint_path_tests {
     // for R(A) at the PC where A was most recently written, so the emitted
     // local picks up the field name instead of a generic `v3` / `fn2`.
 
-    const OP_SETTABLEKS: u8 = 16;
-    const OP_SETLIST: u8    = 55;
-    const OP_NAMECALL: u8   = 20;
-    const OP_NEWTABLE: u8   = 53;
+    const OP_SETTABLEKS: u8 = LuauOpcode::SetTableKS as u8;
+    const OP_SETLIST: u8    = LuauOpcode::SetList as u8;
+    const OP_NAMECALL: u8   = LuauOpcode::NameCall as u8;
+    const OP_NEWTABLE: u8   = LuauOpcode::NewTable as u8;
 
     #[test]
     fn b45b_settableks_installs_named_at_prior_write_pc() {
@@ -3517,12 +3574,12 @@ mod hint_path_tests {
 
     // ── Phase B0.93: extended hint propagation tests ──────────────────
 
-    const OP_CONCAT: u8 = 49;
-    const OP_BAND: u8   = 84;
-    const OP_BOR: u8    = 85;
-    const OP_BXOR: u8   = 86;
-    const OP_MODK: u8   = 43;
-    const OP_POWK: u8   = 44;
+    const OP_CONCAT: u8 = LuauOpcode::Concat as u8;
+    const OP_BAND: u8   = LuauOpcode::Band as u8;
+    const OP_BOR: u8    = LuauOpcode::Bor as u8;
+    const OP_BXOR: u8   = LuauOpcode::Bxor as u8;
+    const OP_MODK: u8   = LuauOpcode::ModK as u8;
+    const OP_POWK: u8   = LuauOpcode::PowK as u8;
 
     #[test]
     fn b093_concat_propagates_lhs_name() {
@@ -3889,16 +3946,17 @@ mod b0106_reserved_word_guard_tests {
 #[cfg(test)]
 mod b096_passthrough_hint_tests {
     use super::{analyze_register_usage, RegisterHint};
+    use crate::parser::opcodes::LuauOpcode;
     use crate::parser::types::{Constant, Proto};
 
-    const OP_GETGLOBAL: u8 = 7;
-    const OP_NOT: u8 = 50;
-    const OP_MINUS: u8 = 51;
-    const OP_LENGTH: u8 = 52;
-    const OP_BNOT: u8 = 87;
-    const OP_SHL: u8 = 88;
-    const OP_SHR: u8 = 89;
-    const OP_RETURN: u8 = 22;
+    const OP_GETGLOBAL: u8 = LuauOpcode::GetGlobal as u8;
+    const OP_NOT: u8 = LuauOpcode::Not as u8;
+    const OP_MINUS: u8 = LuauOpcode::Minus as u8;
+    const OP_LENGTH: u8 = LuauOpcode::Length as u8;
+    const OP_BNOT: u8 = LuauOpcode::Bnot as u8;
+    const OP_SHL: u8 = LuauOpcode::Shl as u8;
+    const OP_SHR: u8 = LuauOpcode::Shr as u8;
+    const OP_RETURN: u8 = LuauOpcode::Return as u8;
 
     fn insn_abc(op: u8, a: u8, b: u8, c: u8) -> u32 {
         (op as u32) | ((a as u32) << 8) | ((b as u32) << 16) | ((c as u32) << 24)
@@ -4037,8 +4095,8 @@ mod b096_passthrough_hint_tests {
     }
 
     // Phase B0.100: And/Or hint propagation tests
-    const OP_AND: u8 = 45;
-    const OP_OR: u8 = 46;
+    const OP_AND: u8 = LuauOpcode::And as u8;
+    const OP_OR: u8 = LuauOpcode::Or as u8;
 
     #[test]
     fn b100_or_propagates_hint_from_b() {
@@ -4845,13 +4903,14 @@ mod b066_tests {
 #[cfg(test)]
 mod b065_tests {
     use super::{decompile_proto, DecompileContext};
+    use crate::parser::opcodes::LuauOpcode;
     use crate::parser::types::{Chunk, Constant, Proto};
 
     // Canonical (non-shuffled) Luau v6 opcode bytes.
-    const OP_GETGLOBAL: u8  = 7;
-    const OP_GETTABLEKS: u8 = 15;
-    const OP_ADDK: u8       = 39;
-    const OP_RETURN: u8     = 22;
+    const OP_GETGLOBAL: u8  = LuauOpcode::GetGlobal as u8;
+    const OP_GETTABLEKS: u8 = LuauOpcode::GetTableKS as u8;
+    const OP_ADDK: u8       = LuauOpcode::AddK as u8;
+    const OP_RETURN: u8     = LuauOpcode::Return as u8;
 
     fn insn_ad(op: u8, a: u8, d: i16) -> u32 {
         let du = d as u16 as u32;

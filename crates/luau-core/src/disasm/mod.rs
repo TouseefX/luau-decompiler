@@ -125,6 +125,22 @@ fn format_instruction(
     match op {
         LuauOpcode::Nop | LuauOpcode::Break | LuauOpcode::Deprecated61 => String::new(),
 
+        // Luau classes / typed userdata. Not modelled by the lifter, but they
+        // must disassemble with their real names so a listing stays readable
+        // and any instruction-stream desync is obvious.
+        LuauOpcode::GetUdataKS | LuauOpcode::SetUdataKS => {
+            format!("R{} R{} aux=0x{:08x}", a, b, aux.unwrap_or(0))
+        }
+        LuauOpcode::NameCallUdata => format!("R{} R{} aux=0x{:08x}", a, b, aux.unwrap_or(0)),
+        LuauOpcode::NewClassMember => format!("R{} R{} aux=0x{:08x}", a, b, aux.unwrap_or(0)),
+        LuauOpcode::CmpProto => format!("R{} R{} aux=0x{:08x}", a, b, aux.unwrap_or(0)),
+        LuauOpcode::CallFb => format!("R{} args={} results={}", a, b.saturating_sub(1), c.saturating_sub(1)),
+        LuauOpcode::FastPCall => format!("R{} builtin={}", a, b),
+        LuauOpcode::NewClass | LuauOpcode::Construct => {
+            format!("R{} aux=0x{:08x}", a, aux.unwrap_or(0))
+        }
+        LuauOpcode::FinConstruct => format!("R{}", a),
+
         LuauOpcode::LoadNil => format!("R{}", a),
         LuauOpcode::LoadB => {
             if c > 0 {

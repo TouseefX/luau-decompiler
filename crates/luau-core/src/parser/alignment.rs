@@ -606,11 +606,19 @@ mod tests {
     fn canonical_tables_agree_with_opcode_enum() {
         assert_eq!(canonical_opcode_name(RETURN), Some("RETURN"));
         assert_eq!(canonical_opcode_name(MOVE), Some("MOVE"));
-        // Canonical 60 is FASTCALL3, which the internal layout numbers 83.
+        // Canonical 60 is FASTCALL3. The two numberings are IDENTICAL over the
+        // canonical range — canonical Luau has 0..=82 and this crate's table
+        // agrees with it opcode for opcode — so the translation of 60 is 60.
+        // (This assertion used to demand 83, encoding a drifted internal table
+        // in which FASTCALL3 sat one slot later; that drift mis-decoded real
+        // client bytecode.)
         assert_eq!(canonical_opcode_name(60), Some("FASTCALL3"));
-        assert_eq!(canonical_to_internal(60), Some(83));
-        // 83+ has no canonical meaning.
+        assert_eq!(canonical_to_internal(60), Some(60));
+        // 83+ has no canonical meaning: canonical Luau stops at 82, and 83+ are
+        // the Roblox-only extension opcodes.
         assert_eq!(canonical_opcode_name(83), None);
+        assert_eq!(canonical_to_internal(83), None);
+        assert_eq!(canonical_opcode_name(82), Some("IDIVK"));
         assert!(canonical_has_aux(GETTABLEKS));
         assert!(!canonical_has_aux(MOVE));
     }

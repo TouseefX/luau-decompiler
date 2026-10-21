@@ -88,7 +88,11 @@ pub fn report(proto: &str, line_defined: u32, code: &[u32]) {
             key,
             missed.len(),
             total,
-            &missed[..missed.len().min(12)]
+            if std::env::var("LUAU_WALK_COVER_ALL").is_ok() {
+                format!("{:?}", missed)
+            } else {
+                format!("{:?}", &missed[..missed.len().min(12)])
+            }
         );
     }
     SEEN.with(|s| {

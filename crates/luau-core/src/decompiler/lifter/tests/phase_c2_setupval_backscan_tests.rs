@@ -20,18 +20,19 @@
 //! handler path is idempotent with (and strictly first-wins vs) that pass.
 
 use crate::decompiler::{decompile_proto, DecompileContext};
+use crate::parser::opcodes::LuauOpcode;
 use crate::parser::types::{Chunk, Constant, Proto};
 
 // Canonical Luau v6 opcode bytes (identity opmap, matching Chunk.version = 6).
-const OP_LOADN: u8     = 4;
-const OP_LOADK: u8     = 5;
-const OP_MOVE: u8      = 6;
-const OP_GETUPVAL: u8  = 9;
-const OP_SETUPVAL: u8  = 10;
-const OP_GETIMPORT: u8 = 12;
-const OP_NEWCLOSURE: u8 = 19;
-const OP_RETURN: u8    = 22;
-const OP_CAPTURE: u8   = 70;
+const OP_LOADN: u8     = LuauOpcode::LoadN as u8;
+const OP_LOADK: u8     = LuauOpcode::LoadK as u8;
+const OP_MOVE: u8      = LuauOpcode::Move as u8;
+const OP_GETUPVAL: u8  = LuauOpcode::GetUpval as u8;
+const OP_SETUPVAL: u8  = LuauOpcode::SetUpval as u8;
+const OP_GETIMPORT: u8 = LuauOpcode::GetImport as u8;
+const OP_NEWCLOSURE: u8 = LuauOpcode::NewClosure as u8;
+const OP_RETURN: u8    = LuauOpcode::Return as u8;
+const OP_CAPTURE: u8   = LuauOpcode::Capture as u8;
 
 fn insn_ad(op: u8, a: u8, d: i16) -> u32 {
     let du = d as u16 as u32;

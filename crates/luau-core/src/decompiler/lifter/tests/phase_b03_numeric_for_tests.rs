@@ -20,17 +20,18 @@
 //! assert on the emitted source.
 
 use crate::ast::Stat;
+use crate::parser::opcodes::LuauOpcode;
 use crate::decompiler::{decompile_proto, DecompileContext};
 use crate::parser::types::{Chunk, Constant, DebugInfo, LocalVar, Proto};
 
 // Standard (non-shuffled) Luau opcode bytes.
-const OP_LOADN: u8     = 4;
-const OP_MOVE: u8      = 6;
-const OP_ADD: u8       = 33;
-const OP_MUL: u8       = 35;
-const OP_RETURN: u8    = 22;
-const OP_FORNPREP: u8  = 56;
-const OP_FORNLOOP: u8  = 57;
+const OP_LOADN: u8     = LuauOpcode::LoadN as u8;
+const OP_MOVE: u8      = LuauOpcode::Move as u8;
+const OP_ADD: u8       = LuauOpcode::Add as u8;
+const OP_MUL: u8       = LuauOpcode::Mul as u8;
+const OP_RETURN: u8    = LuauOpcode::Return as u8;
+const OP_FORNPREP: u8  = LuauOpcode::ForNPrep as u8;
+const OP_FORNLOOP: u8  = LuauOpcode::ForNLoop as u8;
 
 fn insn_ad(op: u8, a: u8, d: i16) -> u32 {
     let du = d as u16 as u32;
@@ -433,12 +434,12 @@ fn descending_for_preserves_negative_step() {
 //   - Phase B0.4 nested NumericFor recognition (`build_nested_for`)
 //   - break-preservation inside for-loop bodies
 
-const OP_LOADNIL: u8    = 2;
-const OP_CALL: u8       = 21;
-const OP_FORGPREP: u8   = 58;
-const OP_FORGLOOP: u8   = 59;
-const OP_JUMPIFLE: u8   = 28;
-const OP_GETIMPORT: u8  = 12;
+const OP_LOADNIL: u8    = LuauOpcode::LoadNil as u8;
+const OP_CALL: u8       = LuauOpcode::Call as u8;
+const OP_FORGPREP: u8   = LuauOpcode::ForGPrep as u8;
+const OP_FORGLOOP: u8   = LuauOpcode::ForGLoop as u8;
+const OP_JUMPIFLE: u8   = LuauOpcode::JumpIfLE as u8;
+const OP_GETIMPORT: u8  = LuauOpcode::GetImport as u8;
 
 /// Builds FORGLOOP AUX: low 24 bits = nresults (loop var count).
 /// Bit 31 = inext flag (we leave it off — plain FORGPREP form).
@@ -1157,7 +1158,7 @@ fn b07_forgprep_without_preceding_call_end_to_end_source() {
 ///   8: RETURN      R2..R2
 fn build_forgprep_with_unresolved_closure_control() -> Chunk {
     // OP_NEWCLOSURE is 19 in the standard Luau opcode table.
-    const OP_NEWCLOSURE: u8 = 19;
+    const OP_NEWCLOSURE: u8 = LuauOpcode::NewClosure as u8;
     let code = vec![
         insn_ad(OP_LOADN,      2, 0),                 // 0 (sum at R2)
         insn_abc(OP_MOVE,      3, 0, 0),              // 1 (R3 = arg0 = generator)

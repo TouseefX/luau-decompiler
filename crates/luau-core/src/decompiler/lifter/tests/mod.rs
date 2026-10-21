@@ -90,3 +90,5 @@ mod arith_table_base_tests;
 #[cfg(test)]
 mod branch_unknown_seed_tests;
 mod self_mutation_peek_tests;
+#[cfg(test)]
+mod fix_regressions_2026_10;

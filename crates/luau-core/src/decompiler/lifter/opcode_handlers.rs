@@ -63,6 +63,436 @@ use super::{
     stmt_budget_tripped,
 };
 
+// ── Parallel (simultaneous) table assignment recovery ───────────────────────
+//
+// Luau compiles `t[a], t[b] = t[b], t[a]` (and every longer rotation) into a
+// group where ALL reads happen before ANY write:
+//
+//     GETTABLEN R1 R0 2      -- R1 = t[2]
+//     GETTABLEN R2 R0 1      -- R2 = t[1]
+//     SETTABLEN R1 R0 1      -- t[1] = R1
+//     SETTABLEN R2 R0 2      -- t[2] = R2
+//
+// Lifting those four instructions one at a time produces two SEQUENTIAL
+// statements:
+//
+//     t[1] = t[2]
+//     t[2] = t[1]
+//
+// which is a different program: the second read observes the value the first
+// statement just wrote (`{20, 20}` instead of `{20, 10}`).  It parses, it
+// looks right, and it silently corrupts every swap / rotation in every script.
+//
+// The fix has to happen at bytecode level, because only there is the
+// read-before-write order visible — a purely textual pass cannot tell a
+// permutation (`t[1], t[2] = t[2], t[1]`) from a copy chain
+// (`t[1] = t[2]; t[3] = t[1]`), and merging the latter would itself be wrong.
+//
+// The recognizer below is deliberately strict; anything it is unsure about
+// falls through to the existing per-instruction path unchanged.  It fires only
+// when the whole group is self-contained (every stored value is a temporary
+// produced by the group's own reads, each used exactly once), the group is not
+// a branch target anywhere, and at least one stored slot is also read by the
+// group (i.e. ordering actually matters).
+
+/// A table slot operand of a parallel-store group.
+#[derive(Clone, Copy)]
+enum PSlot {
+    /// `t[N]` — small integer index (GETTABLEN / SETTABLEN).
+    Index(u8),
+    /// `t[key]` — keyed by an aux constant word.
+    Str(u32),
+    /// `t[reg]` — keyed by a register.
+    Reg(usize),
+}
+
+struct PRead {
+    temp: usize,
+    base: usize,
+    slot: PSlot,
+}
+
+struct PStore {
+    value: usize,
+    base: usize,
+    slot: PSlot,
+}
+
+/// Exact identity of a table slot. Register numbers are used for bases and
+/// register keys so the comparison is conservative: two different registers
+/// that happen to hold the same key are treated as different slots, which can
+/// only make the recognizer decline — never mis-fire.
+fn pslot_key(base: usize, slot: &PSlot) -> String {
+    match slot {
+        PSlot::Index(n) => format!("{}#{}", base, n),
+        PSlot::Str(aux) => format!("{}$k{}", base, aux),
+        PSlot::Reg(r) => format!("{}@r{}", base, r),
+    }
+}
+
+/// Try to read a pure table load at `i`. Returns the next pc.
+fn parse_parallel_read(code: &[u32], i: usize) -> Option<(usize, PRead)> {
+    let insn = code[i];
+    let op = LuauOpcode::from_u8(insn_op(insn));
+    let a = insn_a(insn) as usize;
+    let b = insn_b(insn) as usize;
+    let c = insn_c(insn) as usize;
+    match op {
+        LuauOpcode::GetTableN => Some((
+            i + 1,
+            PRead { temp: a, base: b, slot: PSlot::Index((c + 1) as u8) },
+        )),
+        LuauOpcode::GetTable => Some((
+            i + 1,
+            PRead { temp: a, base: b, slot: PSlot::Reg(c) },
+        )),
+        LuauOpcode::GetTableKS => {
+            let aux = *code.get(i + 1)?;
+            Some((
+                i + 2,
+                PRead { temp: a, base: b, slot: PSlot::Str(aux) },
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// Try to read a pure table store at `i`. Returns the next pc.
+fn parse_parallel_store(code: &[u32], i: usize) -> Option<(usize, PStore)> {
+    let insn = code[i];
+    let op = LuauOpcode::from_u8(insn_op(insn));
+    let a = insn_a(insn) as usize;
+    let b = insn_b(insn) as usize;
+    let c = insn_c(insn) as usize;
+    match op {
+        LuauOpcode::SetTableN => Some((
+            i + 1,
+            PStore { value: a, base: b, slot: PSlot::Index((c + 1) as u8) },
+        )),
+        LuauOpcode::SetTable => Some((
+            i + 1,
+            PStore { value: a, base: b, slot: PSlot::Reg(c) },
+        )),
+        LuauOpcode::SetTableKS => {
+            let aux = *code.get(i + 1)?;
+            Some((
+                i + 2,
+                PStore { value: a, base: b, slot: PSlot::Str(aux) },
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// Is `pc` the target of any branch in this proto?
+///
+/// A group that some other code can jump INTO cannot be collapsed into one
+/// statement, because a jump to its middle would then skip part of it.
+fn is_branch_target(code: &[u32], target: usize) -> bool {
+    let mut pc = 0usize;
+    while pc < code.len() {
+        let insn = code[pc];
+        let op = LuauOpcode::from_u8(insn_op(insn));
+        let step = if op.has_aux() { 2 } else { 1 };
+        match op {
+            LuauOpcode::Jump
+            | LuauOpcode::JumpBack
+            | LuauOpcode::JumpIf
+            | LuauOpcode::JumpIfNot
+            | LuauOpcode::JumpIfEq
+            | LuauOpcode::JumpIfLE
+            | LuauOpcode::JumpIfLT
+            | LuauOpcode::JumpIfNotEq
+            | LuauOpcode::JumpIfNotLE
+            | LuauOpcode::JumpIfNotLT
+            | LuauOpcode::JumpXEqKNil
+            | LuauOpcode::JumpXEqKB
+            | LuauOpcode::JumpXEqKN
+            | LuauOpcode::JumpXEqKS => {
+                let t = (pc as i64 + insn_d(insn) as i64 + 1).max(0) as usize;
+                if t == target {
+                    return true;
+                }
+            }
+            LuauOpcode::JumpX => {
+                let t = (pc as i64 + insn_e(insn) as i64 + 1).max(0) as usize;
+                if t == target {
+                    return true;
+                }
+            }
+            LuauOpcode::ForNPrep | LuauOpcode::ForNLoop | LuauOpcode::ForGPrep
+            | LuauOpcode::ForGPrepINext | LuauOpcode::ForGPrepNext
+            | LuauOpcode::ForGLoop => {
+                let t = (pc as i64 + insn_d(insn) as i64 + 1).max(0) as usize;
+                if t == target {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+        pc += step;
+    }
+    false
+}
+
+/// Evaluate one *pure, statement-free* instruction into `regs` only.
+///
+/// Luau's register allocator does not always emit a group of table loads
+/// back-to-back: a key like `t[i + 1]` may be recomputed in the middle of the
+/// group (`ADDK R6 R1 K0` between two GETTABLEs).  Those instructions are pure
+/// — they compute a value into a register and have no other effect — so the
+/// recognizer can replay them into `regs` and keep the group intact.
+///
+/// Anything that is not provably pure is rejected, which makes the caller fall
+/// back to the ordinary per-instruction path.
+fn eval_pure_into_regs(
+    ctx: &DecompileContext,
+    proto: &Proto,
+    regs: &mut Vec<RegVal>,
+    pc: usize,
+    reserved: &[usize],
+) -> Option<usize> {
+    let code = &proto.code;
+    let insn = *code.get(pc)?;
+    let op = LuauOpcode::from_u8(insn_op(insn));
+    let a = insn_a(insn) as usize;
+    let b = insn_b(insn) as usize;
+    let c = insn_c(insn) as usize;
+
+    // A filler may never write a register the group depends on.
+    if reserved.contains(&a) {
+        return None;
+    }
+
+    let value = match op {
+        LuauOpcode::LoadN => Expr::Number(insn_d(insn) as f64),
+        LuauOpcode::LoadB => Expr::Bool(b != 0),
+        LuauOpcode::LoadNil => Expr::Nil,
+        LuauOpcode::LoadK => get_const_expr(proto, &ctx.chunk.strings, insn_d(insn) as u32),
+        LuauOpcode::LoadKX => {
+            let aux = *code.get(pc + 1)?;
+            get_const_expr(proto, &ctx.chunk.strings, aux)
+        }
+        LuauOpcode::Move => reg_expr(regs, b),
+        LuauOpcode::AddK => mk_binop_k(proto, &ctx.chunk.strings, regs, b, c as u32, BinOp::Add),
+        LuauOpcode::SubK => mk_binop_k(proto, &ctx.chunk.strings, regs, b, c as u32, BinOp::Sub),
+        LuauOpcode::MulK => mk_binop_k(proto, &ctx.chunk.strings, regs, b, c as u32, BinOp::Mul),
+        LuauOpcode::DivK => mk_binop_k(proto, &ctx.chunk.strings, regs, b, c as u32, BinOp::Div),
+        LuauOpcode::ModK => mk_binop_k(proto, &ctx.chunk.strings, regs, b, c as u32, BinOp::Mod),
+        LuauOpcode::PowK => mk_binop_k(proto, &ctx.chunk.strings, regs, b, c as u32, BinOp::Pow),
+        LuauOpcode::IDivK => mk_binop_k(proto, &ctx.chunk.strings, regs, b, c as u32, BinOp::IDiv),
+        LuauOpcode::Add => mk_binop(regs, b, c, BinOp::Add),
+        LuauOpcode::Sub => mk_binop(regs, b, c, BinOp::Sub),
+        LuauOpcode::Mul => mk_binop(regs, b, c, BinOp::Mul),
+        LuauOpcode::Div => mk_binop(regs, b, c, BinOp::Div),
+        LuauOpcode::Mod => mk_binop(regs, b, c, BinOp::Mod),
+        LuauOpcode::Pow => mk_binop(regs, b, c, BinOp::Pow),
+        LuauOpcode::IDiv => mk_binop(regs, b, c, BinOp::IDiv),
+        LuauOpcode::Minus => mk_unop(regs, b, UnOp::Negate),
+        LuauOpcode::Not => mk_unop(regs, b, UnOp::Not),
+        LuauOpcode::Length => mk_unop(regs, b, UnOp::Length),
+        _ => return None,
+    };
+
+    if a >= regs.len() {
+        regs.resize(a + 8, RegVal::Unknown);
+    }
+    regs[a] = RegVal::Expr(value);
+    Some(pc + if op.has_aux() { 2 } else { 1 })
+}
+
+/// Recognize and lift a complete parallel table-store group starting at `pc`.
+///
+/// Returns the pc just past the group when it fired.
+pub(super) fn try_lift_parallel_store(
+    ctx: &DecompileContext,
+    proto: &Proto,
+    regs: &mut Vec<RegVal>,
+    stmts: &mut Vec<Stat>,
+    pc: usize,
+    end: usize,
+) -> Option<usize> {
+    let code = &proto.code;
+    const MAX_GROUP: usize = 8;
+
+    // 1) A run of pure table reads, tolerating interleaved pure key
+    //    computations (the register allocator emits those inside a group).
+    let mut reads: Vec<PRead> = Vec::new();
+    let mut cur = pc;
+    let mut fillers = 0usize;
+    while cur < end && reads.len() < MAX_GROUP {
+        if let Some((next, r)) = parse_parallel_read(code, cur) {
+            if next > end {
+                return None;
+            }
+            // A temporary must be a real destination, and may not alias a
+            // base, a key register, or another temporary of this group.
+            if reads.iter().any(|x| x.temp == r.temp) {
+                return None;
+            }
+            reads.push(r);
+            cur = next;
+            continue;
+        }
+        // Stores have started: the read phase is over.
+        if parse_parallel_store(code, cur).is_some() {
+            break;
+        }
+        // Pure filler: only allowed while at least one read is pending, and it
+        // may not touch anything the group already depends on.
+        let mut reserved: Vec<usize> = Vec::new();
+        for r in &reads {
+            reserved.push(r.temp);
+            reserved.push(r.base);
+            if let PSlot::Reg(k) = r.slot {
+                reserved.push(k);
+            }
+        }
+        match eval_pure_into_regs(ctx, proto, regs, cur, &reserved) {
+            Some(next) if next <= end && fillers < 6 => {
+                fillers += 1;
+                cur = next;
+            }
+            _ => return None,
+        }
+    }
+    if reads.len() < 2 {
+        return None;
+    }
+
+    // 2) An equally long run of pure table stores.
+    let mut stores: Vec<PStore> = Vec::new();
+    while cur < end && stores.len() < reads.len() {
+        match parse_parallel_store(code, cur) {
+            Some((next, s)) if next <= end => {
+                stores.push(s);
+                cur = next;
+            }
+            _ => return None,
+        }
+    }
+    if stores.len() != reads.len() {
+        return None;
+    }
+    let group_end = cur;
+
+    // 3) Every stored value must be one of the group's own temporaries, used
+    //    exactly once, and every temporary must be consumed.
+    let mut used = vec![false; reads.len()];
+    for s in &stores {
+        let idx = reads.iter().position(|r| r.temp == s.value)?;
+        if used[idx] {
+            return None;
+        }
+        used[idx] = true;
+    }
+    if !used.iter().all(|u| *u) {
+        return None;
+    }
+
+    // 4) Temporaries, bases and register keys must be disjoint: a register
+    //    that doubles as a table base cannot be a snapshot temporary.
+    for r in &reads {
+        if r.temp == r.base {
+            return None;
+        }
+        if let PSlot::Reg(k) = r.slot {
+            if k == r.temp {
+                return None;
+            }
+        }
+        // The base must already hold a known value; otherwise the normal path
+        // has materialization work to do that this rewrite would skip.
+        if !matches!(regs.get(r.base), Some(RegVal::Expr(_))) {
+            return None;
+        }
+    }
+    for s in &stores {
+        if reads.iter().any(|r| r.temp == s.base) {
+            return None;
+        }
+        if !matches!(regs.get(s.base), Some(RegVal::Expr(_))) {
+            return None;
+        }
+        if let PSlot::Reg(k) = s.slot {
+            if reads.iter().any(|r| r.temp == k) {
+                return None;
+            }
+        }
+    }
+
+    // 5) Distinct store targets, and ordering must genuinely matter: at least
+    //    one stored slot is also read by this group. Otherwise ordinary
+    //    sequential emission is already correct and we stay out of the way.
+    let mut write_keys: Vec<String> = Vec::new();
+    for s in &stores {
+        let k = pslot_key(s.base, &s.slot);
+        if write_keys.contains(&k) {
+            return None;
+        }
+        write_keys.push(k);
+    }
+    let read_keys: Vec<String> = reads
+        .iter()
+        .map(|r| pslot_key(r.base, &r.slot))
+        .collect();
+    if !write_keys.iter().any(|w| read_keys.contains(w)) {
+        return None;
+    }
+
+    // 6) No branch may land inside the group.
+    for t in (pc + 1)..group_end {
+        if is_branch_target(code, t) {
+            return None;
+        }
+    }
+
+    // 7) Emit one simultaneous assignment. Values are built from the recorded
+    //    read operands — the pre-state — which is exactly what Luau's
+    //    multi-assignment evaluates before any store lands.
+    let slot_expr = |regs: &Vec<RegVal>, base: usize, slot: &PSlot| -> Expr {
+        let object = Box::new(table_expr(regs, base));
+        match slot {
+            PSlot::Index(n) => Expr::Index {
+                object,
+                key: Box::new(Expr::Number(*n as f64)),
+            },
+            PSlot::Str(aux) => {
+                let field = get_table_string_from_aux(proto, &ctx.chunk.strings, *aux);
+                if is_valid_luau_identifier(&field) {
+                    Expr::Field { object, field }
+                } else {
+                    Expr::Index {
+                        object,
+                        key: Box::new(Expr::String(field)),
+                    }
+                }
+            }
+            PSlot::Reg(r) => Expr::Index {
+                object,
+                key: Box::new(reg_expr(regs, *r)),
+            },
+        }
+    };
+
+    let mut targets: Vec<Expr> = Vec::with_capacity(stores.len());
+    let mut values: Vec<Expr> = Vec::with_capacity(stores.len());
+    for s in &stores {
+        let ridx = reads.iter().position(|r| r.temp == s.value).unwrap();
+        let r = &reads[ridx];
+        targets.push(slot_expr(regs, s.base, &s.slot));
+        values.push(slot_expr(regs, r.base, &r.slot));
+    }
+
+    // Keep the temporaries' register state coherent for any later reader.
+    for r in &reads {
+        regs[r.temp] = RegVal::Expr(slot_expr(regs, r.base, &r.slot));
+    }
+
+    stmts.push(Stat::Assign { targets, values });
+    Some(group_end)
+}
+
 /// Phase C4: emit a `Stat::Comment` when a self-arithmetic instruction
 /// (A==B==C) operates on a register whose value is provably non-numeric —
 /// specifically a `Function` literal or `Nil`.  These patterns are always
@@ -1187,8 +1617,9 @@ pub(super) fn lift_instruction_range(
     let pass_id = crate::decompiler::lifter::next_pass_id();
     if std::env::var("LUAU_LIFTPATH").is_ok() {
         eprintln!(
-            "LIFTPATH	pass={pass_id}	{}	flat	{}..{}",
+            "LIFTPATH\tpass={pass_id}\t{}@{}\tflat\t{}..{}",
             proto.debug_name.as_deref().unwrap_or("?"),
+            proto.line_defined,
             start,
             end
         );
@@ -1303,10 +1734,42 @@ pub(super) fn lift_instruction_range(
             regs.resize(max_reg + 8, RegVal::Unknown);
         }
 
+        // Simultaneous table assignment recovery: `t[i], t[j] = t[j], t[i]`
+        // compiles to all-reads-then-all-writes. Emitting those one at a time
+        // silently turns a swap into two overlapping copies, so the group is
+        // collapsed into a single multi-assignment here, before the
+        // per-instruction match can split it.
+        if matches!(
+            op,
+            LuauOpcode::GetTableN | LuauOpcode::GetTable | LuauOpcode::GetTableKS
+        ) {
+            if let Some(next_pc) =
+                try_lift_parallel_store(ctx, proto, regs, stmts, pc, end)
+            {
+                pc = next_pc;
+                last_len = stmts.len();
+                continue;
+            }
+        }
+
         match op {
             LuauOpcode::Nop | LuauOpcode::Break | LuauOpcode::Coverage
             | LuauOpcode::NativeCall | LuauOpcode::CloseUpvals
             | LuauOpcode::PrepVarargs | LuauOpcode::Capture => {}
+
+            // Luau classes / typed userdata: not modelled. Emitting a marker
+            // keeps the omission VISIBLE instead of silently dropping an
+            // instruction that really does something at runtime.
+            LuauOpcode::GetUdataKS | LuauOpcode::SetUdataKS
+            | LuauOpcode::NameCallUdata | LuauOpcode::NewClassMember
+            | LuauOpcode::CmpProto | LuauOpcode::FastPCall
+            | LuauOpcode::NewClass | LuauOpcode::Construct
+            | LuauOpcode::FinConstruct => {
+                stmts.push(Stat::Comment(format!(
+                    "-- unmodelled opcode {:?} (R{}, R{})",
+                    op, a, b
+                )));
+            }
 
             LuauOpcode::LoadNil => {
                 // A pinned register's nil write is as much a write as any
@@ -2534,6 +2997,33 @@ pub(super) fn lift_instruction_range(
                 // Recursion guard: prevent decompiling a proto that's already on our stack
                 let child_idx_usize = proto_idx.map(|idx| idx as usize);
                 let is_recursive = child_idx_usize.map_or(false, |idx| ctx.proto_stack.contains(&idx));
+                if std::env::var("LUAU_CLOSURE_DEBUG").is_ok() {
+                    // Child table identity: what sits at the D we decoded, at the
+                    // child-relative D minus the first child id, and at D as a
+                    // plain child index. A wrong proto id shows up here as a
+                    // mismatch between the resolved value and `kids[D]`.
+                    let kids = &proto.child_protos;
+                    eprintln!(
+                        "KIDS pc={} codelen={} nkids={} kids[D]={:?} kids[min]={:?} min={:?} max={:?}",
+                        pc,
+                        proto.code.len(),
+                        kids.len(),
+                        kids.get(d_unsigned).copied(),
+                        kids.iter().min().copied(),
+                        proto.child_protos.first().copied(),
+                        proto.child_protos.last().copied()
+                    );
+                    eprintln!(
+                        "CLOSURE pc={} op={:?} D={} resolved={:?} recursive={} stack_len={} stack_tail={:?}",
+                        pc,
+                        op,
+                        d_unsigned,
+                        proto_idx,
+                        is_recursive,
+                        ctx.proto_stack.len(),
+                        ctx.proto_stack.last().copied()
+                    );
+                }
 
                 if is_recursive {
                     // B0.134 / B0.135 / B0.135b: silently skip ALL is_recursive
@@ -2620,7 +3110,45 @@ pub(super) fn lift_instruction_range(
                                     // Try current register state first (has best name info).
                                     // Priority: Name > extract from complex expr > debug info > v{N}
                                     match regs.get(cap_idx as usize) {
-                                        Some(RegVal::Expr(Expr::Name(n))) => n.clone(),
+                                        Some(RegVal::Expr(Expr::Name(n))) => {
+                                            // `local n = start` followed by a closure
+                                            // that WRITES n compiles to: MOVE R1 R0
+                                            // (copy) + CAPTURE REF R1 + SETUPVAL in the
+                                            // child. The captured variable is DISTINCT
+                                            // from the one it was initialised from, so it
+                                            // needs its own declaration. Without one, the
+                                            // child's SETUPVAL silently rewrites the
+                                            // outer variable (a parameter, often), and
+                                            // with debug info the parent's initialiser
+                                            // vanishes entirely — the child then writes a
+                                            // nil global ("arithmetic on nil").
+                                            let alias = n.clone();
+                                            let slot = inferred_upval_names.len() as u8;
+                                            let child_writes_slot = child.code.iter().any(|w| {
+                                                LuauOpcode::from_u8(insn_op(*w))
+                                                    == LuauOpcode::SetUpval
+                                                    && insn_b(*w) == slot
+                                            });
+                                            let mut chosen = alias.clone();
+                                            if child_writes_slot {
+                                                let dbg = ctx.reg_name(proto, cap_idx, cap_pc);
+                                                if dbg != alias
+                                                    && is_valid_luau_identifier(&dbg)
+                                                    && locals.current_name(cap_idx as usize)
+                                                        != Some(dbg.as_str())
+                                                {
+                                                    stmts.push(Stat::Local {
+                                                        names: vec![dbg.clone()],
+                                                        values: vec![Expr::Name(alias)],
+                                                    });
+                                                    regs[cap_idx as usize] =
+                                                        RegVal::Expr(Expr::Name(dbg.clone()));
+                                                    locals.record_name(cap_idx as usize, &dbg);
+                                                    chosen = dbg;
+                                                }
+                                            }
+                                            chosen
+                                        }
                                         // A loop variable is by construction a real,
                                         // correctly-named binding. Without this arm it
                                         // fell through to the raw-bytecode backscan,

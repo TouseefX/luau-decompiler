@@ -16,16 +16,17 @@
 //!   6. SETTABLEN after the table is read out (no inline — materialized)
 
 use crate::decompiler::{decompile_proto, DecompileContext};
+use crate::parser::opcodes::LuauOpcode;
 use crate::parser::types::{Chunk, Constant, Proto};
 
 // Opcode constants mirror the canonical Luau set.
-const OP_LOADN: u8        = 4;
-const OP_LOADK: u8        = 5;
-const OP_MOVE: u8         = 6;
-const OP_SETTABLE: u8     = 14;
-const OP_SETTABLEN: u8    = 18;
-const OP_RETURN: u8       = 22;
-const OP_NEWTABLE: u8     = 53;
+const OP_LOADN: u8        = LuauOpcode::LoadN as u8;
+const OP_LOADK: u8        = LuauOpcode::LoadK as u8;
+const OP_MOVE: u8         = LuauOpcode::Move as u8;
+const OP_SETTABLE: u8     = LuauOpcode::SetTable as u8;
+const OP_SETTABLEN: u8    = LuauOpcode::SetTableN as u8;
+const OP_RETURN: u8       = LuauOpcode::Return as u8;
+const OP_NEWTABLE: u8     = LuauOpcode::NewTable as u8;
 
 fn insn_abc(op: u8, a: u8, b: u8, c: u8) -> u32 {
     (op as u32) | ((a as u32) << 8) | ((b as u32) << 16) | ((c as u32) << 24)
