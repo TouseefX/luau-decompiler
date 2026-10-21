@@ -3771,3 +3771,272 @@ fn recurse_all(expr: &mut Expr) {
         _ => {}
     }
 }
+
+// ────────────────────────────────────────────────────────────────────────────
+// Recover the subject of a dropped `.Parent` temp (bug report #1 residual)
+// ────────────────────────────────────────────────────────────────────────────
+//
+// For `if character and character.Parent then` the compiler emits:
+//
+//     GETUPVAL  R0 U0
+//     JUMPIFNOT R0            -- character
+//     GETUPVAL  R0 U0
+//     GETTABLEKS R0 R0."Parent"
+//     JUMPIFNOT R0            -- character.Parent
+//
+// When the value-selection path lifts the second test it can materialise the
+// `GETTABLEKS` result as a bare register temp (`Parent173`) whose defining
+// statement is then dropped, leaving
+//
+//     if Character ~= nil and Parent173 ~= nil then
+//
+// with `Parent173` undeclared — a nil global, so the branch never runs and
+// every effect inside it disappears. The subject is recoverable with no
+// guessing: the operand immediately to the left of the `and` is exactly the
+// table whose `.Parent` the bytecode read.
+//
+// Only the two-operand, `~= nil`-on-both-sides shape is rewritten, and only for
+// a `Parent<digits>` temp that is genuinely undeclared in scope.
+pub fn restore_dropped_parent_temps(stmts: &mut [Stat]) {
+    use crate::ast::{BinOp, Expr, Stat};
+    type Names = std::collections::HashSet<String>;
+
+    fn nil_test_subject(e: &Expr) -> Option<&Expr> {
+        if let Expr::BinOp { left, op: BinOp::NotEq, right } = e {
+            if matches!(**right, Expr::Nil) {
+                return Some(left);
+            }
+            if matches!(**left, Expr::Nil) {
+                return Some(right);
+            }
+        }
+        None
+    }
+
+    /// `Parent`, `Parent173`, `Parent3571` — the namer's temp spelling.
+    fn is_parent_temp(name: &str) -> bool {
+        match name.strip_prefix("Parent") {
+            Some(rest) => rest.chars().all(|c| c.is_ascii_digit()),
+            None => false,
+        }
+    }
+
+    /// Flatten `((a and b) and c) and d` into `[a, b, c, d]`.
+    fn flatten_and(e: Expr, out: &mut Vec<Expr>) {
+        match e {
+            Expr::BinOp { left, op: BinOp::And, right } => {
+                flatten_and(*left, out);
+                out.push(*right);
+            }
+            other => out.push(other),
+        }
+    }
+
+    /// Any `Parent<digits> ~= nil` test that no `local` in scope binds?
+    fn has_undeclared_parent_temp(e: &Expr, declared: &Names) -> bool {
+        match e {
+            Expr::BinOp { left, right, .. } => {
+                if let Some(Expr::Name(n)) = nil_test_subject(e) {
+                    if is_parent_temp(n) && !declared.contains(n) {
+                        return true;
+                    }
+                }
+                has_undeclared_parent_temp(left, declared) || has_undeclared_parent_temp(right, declared)
+            }
+            Expr::UnOp { operand, .. } => has_undeclared_parent_temp(operand, declared),
+            _ => false,
+        }
+    }
+
+    fn fix_cond(cond: &mut Expr, declared: &Names) -> bool {
+        if !has_undeclared_parent_temp(cond, declared) {
+            return false;
+        }
+        let taken = std::mem::replace(cond, Expr::Nil);
+        let mut parts: Vec<Expr> = Vec::new();
+        flatten_and(taken, &mut parts);
+        let mut changed = false;
+        for i in 1..parts.len() {
+            let temp = match nil_test_subject(&parts[i]) {
+                Some(Expr::Name(n)) if is_parent_temp(n) && !declared.contains(n) => n.clone(),
+                _ => continue,
+            };
+            let _ = temp;
+            // The operand immediately before the temp is the object whose
+            // `.Parent` the bytecode loaded.
+            let subject = match nil_test_subject(&parts[i - 1]) {
+                Some(s @ (Expr::Name(_) | Expr::Field { .. } | Expr::Index { .. })) => s.clone(),
+                _ => continue,
+            };
+            parts[i] = Expr::BinOp {
+                left: Box::new(Expr::Field {
+                    object: Box::new(subject),
+                    field: "Parent".to_string(),
+                }),
+                op: BinOp::NotEq,
+                right: Box::new(Expr::Nil),
+            };
+            changed = true;
+        }
+        let mut acc = parts.remove(0);
+        for p in parts {
+            acc = Expr::BinOp {
+                left: Box::new(acc),
+                op: BinOp::And,
+                right: Box::new(p),
+            };
+        }
+        *cond = acc;
+        changed
+    }
+
+    fn collect_declared(s: &Stat, out: &mut Names) {
+        match s {
+            Stat::Local { names, .. } => out.extend(names.iter().cloned()),
+            Stat::LocalFunction { name, .. } => {
+                out.insert(name.clone());
+            }
+            Stat::NumericFor { var, .. } => {
+                out.insert(var.clone());
+            }
+            Stat::GenericFor { vars, .. } => out.extend(vars.iter().cloned()),
+            _ => {}
+        }
+    }
+
+    fn walk_fn(func: &mut Expr, outer: &Names, fixed: &mut usize) {
+        if let Expr::Function { params, body, .. } = func {
+            let mut d = outer.clone();
+            d.extend(params.iter().cloned());
+            for s in body.iter() {
+                collect_declared(s, &mut d);
+            }
+            walk(body, &d, fixed);
+        }
+    }
+
+    fn walk(stmts: &mut [Stat], outer: &Names, fixed: &mut usize) {
+        let mut declared = outer.clone();
+        // Treating every declaration in the block as visible throughout only
+        // makes the repair more conservative.
+        for s in stmts.iter() {
+            collect_declared(s, &mut declared);
+        }
+        for s in stmts.iter_mut() {
+            match s {
+                Stat::If { condition, then_body, elseif_clauses, else_body } => {
+                    if fix_cond(condition, &declared) {
+                        *fixed += 1;
+                    }
+                    walk(then_body, &declared, fixed);
+                    for (c, b) in elseif_clauses.iter_mut() {
+                        if fix_cond(c, &declared) {
+                            *fixed += 1;
+                        }
+                        walk(b, &declared, fixed);
+                    }
+                    if let Some(b) = else_body {
+                        walk(b, &declared, fixed);
+                    }
+                }
+                Stat::While { condition, body } => {
+                    if fix_cond(condition, &declared) {
+                        *fixed += 1;
+                    }
+                    walk(body, &declared, fixed);
+                }
+                Stat::Repeat { body, condition } => {
+                    walk(body, &declared, fixed);
+                    if fix_cond(condition, &declared) {
+                        *fixed += 1;
+                    }
+                }
+                Stat::DoBlock { body } => walk(body, &declared, fixed),
+                Stat::NumericFor { body, .. } | Stat::GenericFor { body, .. } => {
+                    walk(body, &declared, fixed)
+                }
+                Stat::LocalFunction { func, .. } => walk_fn(func, &declared, fixed),
+                Stat::MethodFunction { func, .. } => walk_fn(func, &declared, fixed),
+                Stat::Local { values, .. } | Stat::Assign { values, .. } => {
+                    for v in values.iter_mut() {
+                        walk_fn(v, &declared, fixed);
+                        walk_expr_closures(v, &declared, fixed);
+                    }
+                }
+                Stat::Return { values } => {
+                    for v in values.iter_mut() {
+                        walk_fn(v, &declared, fixed);
+                        walk_expr_closures(v, &declared, fixed);
+                    }
+                }
+                Stat::ExprStat(e) => {
+                    walk_fn(e, &declared, fixed);
+                    walk_expr_closures(e, &declared, fixed);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn walk_expr_closures(e: &mut Expr, declared: &Names, fixed: &mut usize) {
+        match e {
+            Expr::Function { body, .. } => walk(body, declared, fixed),
+            Expr::Call { func, args } => {
+                walk_expr_closures(func, declared, fixed);
+                for a in args.iter_mut() {
+                    walk_expr_closures(a, declared, fixed);
+                }
+            }
+            Expr::MethodCall { object, args, .. } => {
+                walk_expr_closures(object, declared, fixed);
+                for a in args.iter_mut() {
+                    walk_expr_closures(a, declared, fixed);
+                }
+            }
+            Expr::BinOp { left, right, .. } => {
+                walk_expr_closures(left, declared, fixed);
+                walk_expr_closures(right, declared, fixed);
+            }
+            Expr::Field { object, .. } => walk_expr_closures(object, declared, fixed),
+            Expr::Index { object, key } => {
+                walk_expr_closures(object, declared, fixed);
+                walk_expr_closures(key, declared, fixed);
+            }
+            Expr::UnOp { operand, .. } => walk_expr_closures(operand, declared, fixed),
+            Expr::Ternary { cond, then_expr, else_expr } => {
+                walk_expr_closures(cond, declared, fixed);
+                walk_expr_closures(then_expr, declared, fixed);
+                walk_expr_closures(else_expr, declared, fixed);
+            }
+            // A closure can hide anywhere, and this chunk is built almost
+            // entirely out of them: `T = { Handler = function() ... end }`,
+            // `task.delay(0.1, function() ... end)`, `setmetatable({}, {...})`.
+            // Missing the Table arm here made the whole pass a no-op on the
+            // ClientRenderer output.
+            Expr::Table { fields } => {
+                for f in fields.iter_mut() {
+                    match f {
+                        crate::ast::TableField::Sequential(e)
+                        | crate::ast::TableField::Named(_, e) => {
+                            walk_expr_closures(e, declared, fixed)
+                        }
+                        crate::ast::TableField::Indexed(k, v) => {
+                            walk_expr_closures(k, declared, fixed);
+                            walk_expr_closures(v, declared, fixed);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut fixed = 0usize;
+    walk(stmts, &std::collections::HashSet::new(), &mut fixed);
+    if fixed > 0 {
+        log::debug!(
+            "restore_dropped_parent_temps: recovered {} `.Parent` subject(s)",
+            fixed
+        );
+    }
+}

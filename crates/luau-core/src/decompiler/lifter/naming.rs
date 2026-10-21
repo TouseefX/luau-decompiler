@@ -185,9 +185,10 @@ impl LocalTracker {
     /// because collapsing two closure writes onto one name lets dead-store
     /// elimination delete the first body.
     pub(super) fn classify_write_nonfn(&mut self, reg: usize, new_name: &str) -> (WriteKind, String) {
-        if std::env::var("LUAU_NO_SHADOW_COLLAPSE").is_ok() {
-            return self.classify_write(reg, new_name);
-        }
+        // DISABLED — see the note on `classify_write_ex`.
+        let _ = new_name;
+        return self.classify_write(reg, new_name);
+        #[allow(unreachable_code)]
         if reg >= self.param_count && self.declared.contains(&reg) && !self.alias_regs.contains(&reg) {
             if let Some(old) = self.current_names.get(&reg).cloned() {
                 if old != "self" {
@@ -219,9 +220,23 @@ impl LocalTracker {
         new_name: &str,
         value: &Expr,
     ) -> (WriteKind, String) {
-        if std::env::var("LUAU_NO_SHADOW_COLLAPSE").is_ok() {
-            return self.classify_write(reg, new_name);
-        }
+        // DISABLED. Reusing one name for every lifetime of a register looks
+        // harmless -- `x = a; x = b` -- but it is only sound while the old
+        // value is DEAD at the second write, and the lifter has no liveness
+        // information. It cost real code: a `SUB` reading the register between
+        // two writes was folded forward past the overwrite, so
+        //
+        //     value2 = value2:ToObjectSpace(value)   -- deleted as a dead store
+        //     value2 = CFrame.new(CameraOffset)
+        //     value2 = value2:Lerp(value2 - vec, k)
+        //
+        // emitted the Lerp on the wrong receiver and dropped the ToObjectSpace
+        // call entirely (the dev report's "Unable to cast Vector3 to
+        // CoordinateFrame", every frame). Register pressure is handled by
+        // scoped declarations, closure sinking and copy propagation instead.
+        let _ = (new_name, value);
+        return self.classify_write(reg, new_name);
+        #[allow(unreachable_code)]
         if matches!(value, Expr::Function { .. }) {
             return self.classify_write(reg, new_name);
         }

@@ -90,3 +90,54 @@ pub fn clear() {
     MINTS.with(|m| m.borrow_mut().clear());
     UNKNOWN_ORIGIN.with(|m| m.borrow_mut().clear());
 }
+
+// ── Minted-but-never-declared audit ─────────────────────────────────────
+//
+// `LUAU_UNDECL_TRACE=1` prints every name this proto MINTED (asked the
+// namer for) that no `local` in the same proto binds. Those are precisely the
+// identifiers the emitted source would read as globals — the "SSA variant
+// without a declaration" defect reported against the client chunk
+// (790 names / 3,202 sites). Printing (proto, reg, pc) alongside pins the
+// call site instead of the symptom.
+
+thread_local! {
+    static MINTED: RefCell<Vec<(usize, u8, usize, String)>> = RefCell::new(Vec::new());
+    static DECLARED: RefCell<BTreeSet<String>> = RefCell::new(BTreeSet::new());
+}
+
+pub fn undecl_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("LUAU_UNDECL_TRACE").is_ok())
+}
+
+pub fn record_mint(proto: usize, reg: u8, pc: usize, name: &str) {
+    if !undecl_enabled() {
+        return;
+    }
+    MINTED.with(|m| m.borrow_mut().push((proto, reg, pc, name.to_string())));
+}
+
+pub fn record_decl(name: &str) {
+    if !undecl_enabled() {
+        return;
+    }
+    DECLARED.with(|d| {
+        d.borrow_mut().insert(name.to_string());
+    });
+}
+
+/// Emit the diff for one proto and clear the buffers.
+pub fn flush_undecl(proto: usize, label: &str) {
+    if !undecl_enabled() {
+        return;
+    }
+    let minted = MINTED.with(|m| m.borrow().clone());
+    let declared = DECLARED.with(|d| d.borrow().clone());
+    for (p, reg, pc, name) in minted {
+        if p == proto && !declared.contains(&name) {
+            eprintln!("UNDECL\t{}@{}\treg={}\tpc={}\t{}", label, proto, reg, pc, name);
+        }
+    }
+    MINTED.with(|m| m.borrow_mut().clear());
+    DECLARED.with(|d| d.borrow_mut().clear());
+}

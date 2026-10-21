@@ -290,7 +290,12 @@ fn eval_pure_into_regs(
         LuauOpcode::IDiv => mk_binop(regs, b, c, BinOp::IDiv),
         LuauOpcode::Minus => mk_unop(regs, b, UnOp::Negate),
         LuauOpcode::Not => mk_unop(regs, b, UnOp::Not),
-        LuauOpcode::Length => mk_unop(regs, b, UnOp::Length),
+        LuauOpcode::Length => {
+            if std::env::var("LUAU_LEN_TRACE").is_ok() {
+                eprintln!("LENHANDLER a={} b={} pcreg={:?}", a, b, regs.get(b as usize));
+            }
+            mk_unop(regs, b, UnOp::Length)
+        }
         _ => return None,
     };
 
@@ -2625,6 +2630,11 @@ pub(super) fn lift_instruction_range(
                 }
             }
             LuauOpcode::Length => {
+                // Measure this chunk before deciding: a dialect that really
+                // compiles `#x` to LENGTH must not inherit the passthrough
+                // default, and one that repurposes the opcode must not be
+                // talked into emitting spurious `#`.
+                ctx.infer_length_semantics();
                 // Canonical Luau uses LENGTH as the real `#` operator, so build
                 // a genuine UnOp there. So does any client whose own compiler
                 // was OBSERVED emitting this opcode for `#x` (see
@@ -2652,6 +2662,22 @@ pub(super) fn lift_instruction_range(
                     };
                     store_complex(ctx, proto, regs, locals, stmts, a, pc, e);
                 } else {
+                    if std::env::var("LUAU_LEN_OPERAND").is_ok() {
+                        let kind = match regs.get(b as usize) {
+                            Some(RegVal::Expr(Expr::String(_))) => "String",
+                            Some(RegVal::Expr(Expr::Table { .. })) => "Table",
+                            Some(RegVal::Expr(Expr::Name(_))) => "Name",
+                            Some(RegVal::Expr(Expr::Call { .. })) => "Call",
+                            Some(RegVal::Expr(Expr::MethodCall { .. })) => "MethodCall",
+                            Some(RegVal::Expr(Expr::Field { .. })) => "Field",
+                            Some(RegVal::Expr(Expr::Number(_))) => "Number",
+                            Some(RegVal::Expr(Expr::BinOp { .. })) => "BinOp",
+                            Some(RegVal::Expr(_)) => "Other",
+                            Some(RegVal::LoopVar(_)) => "LoopVar",
+                            _ => "Unknown",
+                        };
+                        eprintln!("LENOP\t{}@{}\tpc={}\tb={}\t{}", proto.debug_name.as_deref().unwrap_or("?"), proto.line_defined, pc, b, kind);
+                    }
                     let bad_kind: Option<&'static str> = match regs.get(b as usize) {
                         Some(RegVal::Expr(Expr::Bool(_))) => Some("Bool"),
                         Some(RegVal::Expr(Expr::Number(_))) => Some("Number"),
@@ -3105,7 +3131,37 @@ pub(super) fn lift_instruction_range(
                         if is_capture {
                             let cap_type = cap_a;
                             let cap_idx = cap_b;
-                            let name = match cap_type {
+                            // B0.132b — resolve the upvalue from the PARENT'S
+                            // EMITTED BINDING first.
+                            //
+                            // Everything below in this arm infers a name from the
+                            // VALUE the register happens to hold, and the value
+                            // tracker moves on: by the time a closure captures R79
+                            // (which the parent bound as `tbl`), `regs[79]` may be
+                            // mid-`DUPTABLE` or already cleared, so the inference
+                            // falls through to `ctx.reg_name` and mints `tbl5` —
+                            // a name the parent never declares. Every read in the
+                            // child is then a nil global read (7,444 sites on the
+                            // client chunk).
+                            //
+                            // The analyzer's `current_name` for that register is
+                            // not an inference: it is the binding the parent
+                            // actually emitted, and it is exactly what the child
+                            // captures, so ordinary scoping connects the two.
+                            let parent_binding = if matches!(cap_type, 0 | 1) {
+                                locals
+                                    .current_name(cap_idx as usize)
+                                    .filter(|n| {
+                                        is_valid_luau_identifier(n) && !is_stdlib_shadow_name(n)
+                                    })
+                                    .map(|n| n.to_string())
+                            } else {
+                                None
+                            };
+                            let name = if let Some(bound) = parent_binding {
+                                bound
+                            } else {
+                            match cap_type {
                                 // LCL_VAL or LCL_REF: captures local register B from parent
                                 0 | 1 => {
                                     // Try current register state first (has best name info).
@@ -3158,10 +3214,49 @@ pub(super) fn lift_instruction_range(
                                         // (e.g. the strings staged for the iterated table).
                                         Some(RegVal::LoopVar(n)) => n.clone(),
                                         Some(RegVal::Expr(expr)) => {
-                                            // Extract a name from complex expressions:
-                                            // Field access (e.g., game.Foo) -> use the field name
-                                            // MethodCall (e.g., x:GetService("Y")) -> use "Y" or method name
-                                            // Call -> try to extract a meaningful identifier
+                                            // B0.132 — an upvalue IS the parent's local.
+                                            //
+                                            // Every heuristic below GUESSES a name from the
+                                            // shape of the captured expression, and a guess is
+                                            // not a binding: `Expr::Table` fell through to
+                                            // `ctx.reg_name`, which mints `tbl5` for a register
+                                            // whose parent local is called `tbl`. Nothing ever
+                                            // emitted `local tbl5`, so every read in the child
+                                            // was a read of a nil GLOBAL — 1,079 sites on the
+                                            // client chunk for `Assets` alone, 7,444 across the
+                                            // file, and the reported "attempt to index nil".
+                                            //
+                                            // The parent already bound this register to a name
+                                            // (`current_name`), and that binding is exactly
+                                            // what the child captures. Using it is not a guess:
+                                            // it is the same variable, already declared in an
+                                            // enclosing scope, so ordinary Luau scoping does
+                                            // the rest — which is also what the source looked
+                                            // like before compilation.
+                                            if let Ok(w) = std::env::var("LUAU_CAP_WATCH") {
+                                                if w.parse::<usize>().unwrap_or(usize::MAX) == cap_idx as usize {
+                                                    eprintln!(
+                                                        "CAPEXPR\t{}@{}\treg={}\tpc={}\texpr={:?}\tcur={:?}",
+                                                        proto.debug_name.as_deref().unwrap_or("?"),
+                                                        proto.line_defined,
+                                                        cap_idx,
+                                                        cap_pc,
+                                                        std::mem::discriminant(expr),
+                                                        locals.current_name(cap_idx as usize),
+                                                    );
+                                                    eprintln!("CAPEXPR_FULL\t{:?}", expr);
+                                                }
+                                            }
+                                            let parent_bound = locals
+                                                .current_name(cap_idx as usize)
+                                                .filter(|n| {
+                                                    is_valid_luau_identifier(n)
+                                                        && !is_stdlib_shadow_name(n)
+                                                })
+                                                .map(|n| n.to_string());
+                                            if let Some(bound) = parent_bound {
+                                                bound
+                                            } else {
                                             match expr {
                                                 Expr::Field { field, .. } => field.clone(),
                                                 Expr::MethodCall { method, args, .. } => {
@@ -3194,8 +3289,23 @@ pub(super) fn lift_instruction_range(
                                                 }
                                                 _ => ctx.reg_name(proto, cap_idx, cap_pc),
                                             }
+                                            }
                                         }
                                         _ => {
+                                            if let Ok(w) = std::env::var("LUAU_CAP_WATCH") {
+                                                if w.parse::<usize>().unwrap_or(usize::MAX) == cap_idx as usize {
+                                                    eprintln!(
+                                                        "CAPUNK\t{}@{}\treg={}\tpc={}\tholds={:?}\tcur={:?}\tlocals_decl={}",
+                                                        proto.debug_name.as_deref().unwrap_or("?"),
+                                                        proto.line_defined,
+                                                        cap_idx,
+                                                        cap_pc,
+                                                        regs.get(cap_idx as usize),
+                                                        locals.current_name(cap_idx as usize),
+                                                        locals.declared.contains(&(cap_idx as usize)),
+                                                    );
+                                                }
+                                            }
                                             // B0.131c: register is Unknown — backscan
                                             // the raw bytecode for the last instruction
                                             // that wrote to cap_idx and extract a name.
@@ -3278,6 +3388,7 @@ pub(super) fn lift_instruction_range(
                                     }
                                 }
                                 _ => String::new(),
+                            }
                             };
 
                             // A REF capture (type 1) whose source register is a
@@ -3876,11 +3987,36 @@ pub(super) fn lift_instruction_range(
                         | "IsA" | "GetAttribute" | "SetAttribute"
                     ));
                 if is_string_arg_method {
-                    for arg in args.iter_mut() {
-                        if let Expr::Number(n) = arg {
-                            let idx = *n as u32;
-                            if let Some(Constant::String(s)) = proto.constants.get(idx as usize) {
-                                *arg = Expr::String(s.clone());
+                    // FIRST ARGUMENT ONLY, and never to a method name.
+                    //
+                    // This rule dates from LOADN/LOADK confusion, where a
+                    // constant INDEX was loaded as a raw integer and the name
+                    // argument arrived as a number. It rewrote EVERY numeric
+                    // argument of these methods, so any genuinely numeric
+                    // argument was replaced by whatever string sat at that
+                    // constant index:
+                    //
+                    //   WaitForChild("Bars", 15)  ->  WaitForChild("Bars", "UserService")
+                    //   SetAttribute("Id", k3)    ->  SetAttribute("Id", "Instance")
+                    //   WaitForChild(v)           ->  WaitForChild("FindFirstChildOfClass")
+                    //
+                    // — the dev report's bugs 6, 8b and 9. Only the name slot
+                    // (argument 0) can be a child/class name, so that is the
+                    // only position worth correcting.
+                    if let Some(Expr::Number(n)) = args.first() {
+                        let idx = *n as u32;
+                        if let Some(Constant::String(s)) = proto.constants.get(idx as usize) {
+                            let is_method_name = matches!(
+                                s.as_str(),
+                                "FindFirstChild" | "FindFirstChildOfClass"
+                                    | "FindFirstChildWhichIsA" | "WaitForChild"
+                                    | "GetChildren" | "GetDescendants" | "Clone"
+                                    | "Destroy" | "IsA" | "GetService" | "GetAttribute"
+                                    | "SetAttribute"
+                            );
+                            if !is_method_name {
+                                let s = s.clone();
+                                args[0] = Expr::String(s);
                             }
                         }
                     }
@@ -3961,8 +4097,22 @@ pub(super) fn lift_instruction_range(
                             let prev_a = insn_a(prev_insn) as usize;
                             let prev_d = insn_d(prev_insn);
                             if prev_a == arg_reg {
-                                // This instruction targeted our argument register.
-                                // Try interpreting its D field as a constant index.
+                                // ONLY a LOADK's D field is a constant index.
+                                //
+                                // This used to accept any instruction whose A
+                                // matched the argument register, then read its D
+                                // field as a constant index. For
+                                //   GETUPVAL R4 U0      -> constants[0]
+                                //   MOVE     R115 R111  -> constants[111]
+                                // that turns an upvalue/register number into a
+                                // string literal:
+                                //   SetAttribute("Id", k3)  ->  SetAttribute("Id", "Instance")
+                                //   WaitForChild(v)         ->  WaitForChild("FindFirstChildOfClass")
+                                // — report bugs #6 and #9. Anything that is not a
+                                // LOADK cannot name a constant, so stop here.
+                                if LuauOpcode::from_u8(insn_op(prev_insn)) != LuauOpcode::LoadK {
+                                    break;
+                                }
                                 let kidx = prev_d as u16 as usize;
                                 if let Some(Constant::String(s)) = proto.constants.get(kidx) {
                                     if is_valid_luau_identifier(s) {

@@ -250,6 +250,8 @@ pub struct DecompileContext<'a> {
     /// that byte for `#x`. A database entry records the observation; anything
     /// that has not made it stays on passthrough.
     pub unary: crate::parser::opmap_db::UnarySemantics,
+    /// Set once `infer_length_semantics` has examined this chunk.
+    pub length_scan_done: bool,
     /// Temps holding the result of a CALL whose C operand pinned it to exactly
     /// one result (`local x = (f())` in source terms).
     ///
@@ -284,6 +286,7 @@ impl<'a> DecompileContext<'a> {
             capture_global_upvals: std::collections::HashMap::new(),
             is_canonical_luau: false,
             unary: crate::parser::opmap_db::UnarySemantics::default(),
+            length_scan_done: false,
             arity_pinned_temps: std::collections::HashSet::new(),
             current_loop_end: None,
         }
@@ -309,6 +312,126 @@ impl<'a> DecompileContext<'a> {
     /// an inferred map does not.
     pub fn set_unary_semantics(&mut self, unary: crate::parser::opmap_db::UnarySemantics) {
         self.unary = unary;
+    }
+
+    /// Decide, from this chunk's own bytecode, whether `LENGTH` really is `#`.
+    ///
+    /// The passthrough default exists because a misdetected opcode map makes
+    /// `LENGTH` look like `#` in chunks where it is something else, and the
+    /// spurious `#vN` output is worse than dropping the operator. But the
+    /// default is per-DIALECT, and a dialect that genuinely compiles `#x` to
+    /// `LENGTH` then loses every length in the file. The client chunk is that
+    /// case: 88 `LENGTH` words, 90 lift sites, and only 42 `#` in the output —
+    /// the rest became bare passthroughs (`for i = 1, tbl436 do` for
+    /// `for i = 1, #tbl436 do`), which the reporter saw as
+    /// "invalid 'for' limit (number expected, got table)".
+    ///
+    /// Two pieces of evidence decide it, and the rule is deliberately one-sided:
+    ///
+    ///   PASSTHROUGH — the operand register was just loaded with a NUMBER
+    ///   (`LOADN`, or `LOADK` of a numeric constant). `#5` is not valid Luau, so
+    ///   a single such site proves this chunk is not using LENGTH as `#`.
+    ///
+    ///   OPERATOR — the result register feeds arithmetic or a numeric `for`
+    ///   bound. That is where `#` is used, and it is not somewhere a
+    ///   repurposed opcode would land by accident.
+    ///
+    /// Upgrade only when there is positive operator evidence AND no passthrough
+    /// evidence at all. A single contradicting site keeps the default, so a
+    /// chunk that is genuinely ambiguous is left exactly as it was.
+    pub fn infer_length_semantics(&mut self) {
+        if self.length_scan_done {
+            return;
+        }
+        self.length_scan_done = true;
+        if self.unary.length == crate::parser::opmap_db::UnarySem::Operator {
+            return;
+        }
+        use crate::parser::types::{insn_a, insn_b, insn_c, Constant};
+        let mut operator_evidence = 0usize;
+        let mut passthrough_evidence = 0usize;
+        for proto in &self.chunk.protos {
+            let code = &proto.code;
+            let mut pc = 0usize;
+            while pc < code.len() {
+                let insn = code[pc];
+                let op = crate::parser::opcodes::LuauOpcode::from_u8((insn & 0xFF) as u8);
+                if !matches!(op, crate::parser::opcodes::LuauOpcode::Length) {
+                    pc += if op.has_aux() { 2 } else { 1 };
+                    continue;
+                }
+                let a = insn_a(insn) as usize;
+                let b = insn_b(insn) as usize;
+
+                // (1) Was the operand just loaded as a number? Then `#` is
+                //     impossible here and the passthrough default is right.
+                let mut back = pc;
+                let mut steps = 0;
+                while back > 0 && steps < 8 {
+                    back -= 1;
+                    let prev = code[back];
+                    let pop = crate::parser::opcodes::LuauOpcode::from_u8((prev & 0xFF) as u8);
+                    if insn_a(prev) as usize != b {
+                        steps += 1;
+                        continue;
+                    }
+                    match pop {
+                        crate::parser::opcodes::LuauOpcode::LoadN => passthrough_evidence += 1,
+                        crate::parser::opcodes::LuauOpcode::LoadK => {
+                            let k = crate::parser::types::insn_d(prev) as usize;
+                            if matches!(proto.constants.get(k), Some(Constant::Number(_))) {
+                                passthrough_evidence += 1;
+                            }
+                        }
+                        _ => {}
+                    }
+                    break;
+                }
+
+                // (2) Does the result feed arithmetic or a numeric-for bound?
+                let mut fwd = pc + 1;
+                let mut steps2 = 0;
+                while fwd < code.len() && steps2 < 6 {
+                    let nxt = code[fwd];
+                    let nop = crate::parser::opcodes::LuauOpcode::from_u8((nxt & 0xFF) as u8);
+                    let uses = insn_a(nxt) as usize == a
+                        || insn_b(nxt) as usize == a
+                        || insn_c(nxt) as usize == a;
+                    if uses {
+                        use crate::parser::opcodes::LuauOpcode as O;
+                        if matches!(
+                            nop,
+                            O::Sub | O::Add | O::Mul | O::Div | O::Mod | O::Pow
+                                | O::SubK | O::AddK | O::MulK | O::DivK | O::ModK | O::PowK
+                                | O::ForNPrep | O::ForNLoop
+                        ) {
+                            operator_evidence += 1;
+                        }
+                        break;
+                    }
+                    steps2 += 1;
+                    fwd += 1;
+                }
+
+                pc += 1;
+            }
+        }
+        if std::env::var("LUAU_LEN_TRACE").is_ok() {
+            eprintln!("LENINFER operator={} passthrough={}", operator_evidence, passthrough_evidence);
+        }
+        // Ratio, not unanimity. A repurposed LENGTH writes its operand value
+        // somewhere (a field, a table slot, a call argument) — it does not
+        // routinely feed arithmetic — so a lopsided count is the signal, and a
+        // couple of stray numeric-operand sites must not veto 48 arithmetic
+        // ones. On the client chunk this reads 48 vs 2; requiring unanimity
+        // left every length in the file dropped.
+        if operator_evidence >= 4 && passthrough_evidence.saturating_mul(4) <= operator_evidence {
+            log::debug!(
+                "LENGTH inference: {operator_evidence} arithmetic/numeric-for consumers, \
+                 0 numeric-operand sites -> treating LENGTH as `#` for this chunk"
+            );
+            self.unary.length = crate::parser::opmap_db::UnarySem::Operator;
+        }
     }
 
     /// Initialize naming context for a proto with register hints from pre-pass.
@@ -469,12 +592,22 @@ impl<'a> DecompileContext<'a> {
 
         // Synthesize a context-aware name using register hints
         let name = self.synthesize_name(reg, pc);
+        if let Ok(w) = std::env::var("LUAU_NAME_WATCH") {
+            if w == name {
+                let pi = self.current_proto_index.unwrap_or(0);
+                let hint = self.proto_naming.get(&pi)
+                    .and_then(|n| n.hints.get(&reg))
+                    .and_then(|h| select_hint(h, pc));
+                eprintln!("NAMEWATCH\t{}\tproto={}\treg={}\tpc={}\thint={:?}", name, pi, reg, pc, hint);
+            }
+        }
 
         // Cache the assignment
         if let Some(pi) = self.current_proto_index {
             if let Some(naming) = self.proto_naming.get_mut(&pi) {
                 naming.assigned.insert((reg, pc), name.clone());
             }
+            crate::decompiler::mint_trace::record_mint(pi, reg, pc, &name);
         }
 
         name
@@ -553,6 +686,7 @@ impl<'a> DecompileContext<'a> {
                 };
                 self.used_names.insert(name.clone());
                 self.remember_stable_name(pi, reg, key, &name);
+                crate::decompiler::mint_trace::record_mint(pi, reg, pc, &name);
                 return name;
             }
         }
@@ -638,7 +772,21 @@ impl<'a> DecompileContext<'a> {
     fn gen_scoped_name(&mut self, prefix: &str) -> String {
         if let Some(pi) = self.current_proto_index {
             if let Some(naming) = self.proto_naming.get_mut(&pi) {
-                let name = naming.unique_name(prefix, &self.used_names);
+                let mut name = naming.unique_name(prefix, &self.used_names);
+                // `unique_name` appends a counter, so a harmless prefix can
+                // still collide with a library global: `Color` + 3 = `Color3`,
+                // `CFrame` + 1 = `CFrame1` is fine but `Vector` + 2 = `Vector2`
+                // is not. The `Named` arm screens the PREFIX against
+                // `is_stdlib_shadow_name`; the counter makes the check
+                // necessary again on the final spelling. A local named
+                // `Color3` shadows the constructor, and the very next
+                // `Color3.fromRGB` in that scope then indexes a Color value —
+                // the dev report's bug #4.
+                let mut guard = 0;
+                while is_stdlib_shadow_name(&name) && guard < 32 {
+                    name = naming.unique_name(&format!("{}_", prefix), &self.used_names);
+                    guard += 1;
+                }
                 self.used_names.insert(name.clone());
                 return name;
             }
@@ -1071,7 +1219,23 @@ pub fn is_stdlib_shadow_name(s: &str) -> bool {
         | "loadstring" | "newproxy" | "wait" | "delay" | "spawn"
         | "tick" | "time" | "os" | "math" | "string" | "table"
         | "coroutine" | "debug" | "bit32" | "buffer" | "utf8"
-        | "task" | "game" | "workspace" | "script")
+        | "task" | "game" | "workspace" | "script"
+        // Roblox datatypes whose constructors are called BY NAME.
+        //
+        // A local called `CFrame` is not merely untidy: `local CFrame =
+        // RootPart.CFrame` shadows the library, and the next `CFrame.new(...)`
+        // in the same scope calls nil. The reporter hit exactly this
+        // ("attempt to call a nil value") on a chunk where `.CFrame` is a very
+        // common field name, so the field-derived name was already colliding.
+        // `.Position`, `.Size` and `.Value` are the same shape but harmless —
+        // no global of those names exists — so only the constructor-bearing
+        // types are listed here.
+        | "CFrame" | "Vector3" | "Vector2" | "Vector2int16" | "Vector3int16"
+        | "UDim" | "UDim2" | "Color3" | "ColorSequence" | "ColorSequenceKeypoint"
+        | "NumberSequence" | "NumberSequenceKeypoint" | "NumberRange"
+        | "Rect" | "Region3" | "Region3int16" | "Ray" | "TweenInfo"
+        | "BrickColor" | "Instance" | "Enum" | "PhysicalProperties"
+        | "Faces" | "Axes" | "Random" | "DateTime" | "Font" | "Vector3int16")
 }
 
 /// Check if a string is a valid Luau identifier (starts with letter/underscore,
@@ -2109,6 +2273,30 @@ pub fn note_proto_emitted(proto_index: usize) {
 }
 
 pub fn decompile_proto(ctx: &mut DecompileContext, proto: &Proto, proto_index: usize, depth: usize) -> String {
+    decompile_proto_inner(ctx, proto, proto_index, depth, depth == 0, false)
+}
+
+/// Decompile a proto that has **no parent binding** — the detached/orphan
+/// protos a chunk can report. Their upvalues cannot resolve to anything, so the
+/// free-variable pass must run here; leaving them undeclared turned every read
+/// in those bodies into a nil global (`script_2`, `lib`, `upval_N`).
+pub fn decompile_orphan_proto(
+    ctx: &mut DecompileContext,
+    proto: &Proto,
+    proto_index: usize,
+    depth: usize,
+) -> String {
+    decompile_proto_inner(ctx, proto, proto_index, depth, true, true)
+}
+
+fn decompile_proto_inner(
+    ctx: &mut DecompileContext,
+    proto: &Proto,
+    proto_index: usize,
+    depth: usize,
+    declare_free: bool,
+    declare_free_orphan: bool,
+) -> String {
     note_proto_emitted(proto_index);
     let mut stmts = lifter::lift_proto(ctx, proto, proto_index);
 
@@ -2141,11 +2329,18 @@ pub fn decompile_proto(ctx: &mut DecompileContext, proto: &Proto, proto_index: u
                 lifter::post_passes::sink_single_use_closures(&mut stmts)
             });
         }
+        crate::decompiler::lifter::timed("restore_dropped_parent_temps", || {
+            lifter::post_passes::restore_dropped_parent_temps(&mut stmts)
+        });
     }
 
-    if depth == 0 {
+    if declare_free {
         let declared = crate::decompiler::lifter::timed("declare_free_vars", || {
-            free_var_decls::declare_free_vars(&mut stmts)
+if declare_free_orphan {
+                free_var_decls::declare_free_vars_orphan(&mut stmts)
+            } else {
+                free_var_decls::declare_free_vars(&mut stmts)
+            }
         });
         if !declared.is_empty() {
             log::debug!(
@@ -2156,9 +2351,125 @@ pub fn decompile_proto(ctx: &mut DecompileContext, proto: &Proto, proto_index: u
         }
     }
 
+    // `LUAU_UNDECL_TRACE`: report names this proto asked the namer for that no
+    // `local` in the same proto binds. Those read as globals at runtime.
+    if crate::decompiler::mint_trace::undecl_enabled() {
+        let mut names = std::collections::BTreeSet::new();
+        collect_local_names(&stmts, &mut names);
+        for n in &names {
+            crate::decompiler::mint_trace::record_decl(n);
+        }
+        let label = proto.debug_name.as_deref().map(|s| s.to_string())
+            .unwrap_or_else(|| format!("?@{}", proto.line_defined));
+        crate::decompiler::mint_trace::flush_undecl(proto_index, &label);
+    }
+
     let mut output = String::new();
     crate::decompiler::lifter::timed("emit_block", || emit::emit_block(&mut output, &stmts, depth));
     output
+}
+
+/// Every name bound by a `local`, `local function`, for-variable or parameter
+/// anywhere in the tree (shadowing included; this is a membership audit).
+fn collect_local_names(stmts: &[crate::ast::Stat], out: &mut std::collections::BTreeSet<String>) {
+    use crate::ast::{Expr, Stat};
+    for s in stmts {
+        match s {
+            Stat::Local { names, values } => {
+                out.extend(names.iter().cloned());
+                for v in values {
+                    collect_local_names_expr(v, out);
+                }
+            }
+            Stat::LocalFunction { name, func } => {
+                out.insert(name.clone());
+                collect_local_names_expr(func, out);
+            }
+            Stat::NumericFor { var, body, .. } => {
+                out.insert(var.clone());
+                collect_local_names(body, out);
+            }
+            Stat::GenericFor { vars, body, .. } => {
+                out.extend(vars.iter().cloned());
+                collect_local_names(body, out);
+            }
+            Stat::MethodFunction { func, .. } => collect_local_names_expr(func, out),
+            Stat::If { then_body, elseif_clauses, else_body, .. } => {
+                collect_local_names(then_body, out);
+                for (_, b) in elseif_clauses {
+                    collect_local_names(b, out);
+                }
+                if let Some(b) = else_body {
+                    collect_local_names(b, out);
+                }
+            }
+            Stat::While { body, .. } | Stat::Repeat { body, .. } | Stat::DoBlock { body } => {
+                collect_local_names(body, out)
+            }
+            Stat::Assign { values, .. } => {
+                for v in values {
+                    collect_local_names_expr(v, out);
+                }
+            }
+            Stat::Return { values } => {
+                for v in values {
+                    collect_local_names_expr(v, out);
+                }
+            }
+            Stat::ExprStat(e) => collect_local_names_expr(e, out),
+            _ => {}
+        }
+    }
+}
+
+fn collect_local_names_expr(expr: &crate::ast::Expr, out: &mut std::collections::BTreeSet<String>) {
+    use crate::ast::Expr;
+    match expr {
+        Expr::Function { params, body, .. } => {
+            out.extend(params.iter().cloned());
+            collect_local_names(body, out);
+        }
+        Expr::Field { object, .. } => collect_local_names_expr(object, out),
+        Expr::Index { object, key } => {
+            collect_local_names_expr(object, out);
+            collect_local_names_expr(key, out);
+        }
+        Expr::BinOp { left, right, .. } => {
+            collect_local_names_expr(left, out);
+            collect_local_names_expr(right, out);
+        }
+        Expr::UnOp { operand, .. } => collect_local_names_expr(operand, out),
+        Expr::Call { func, args } => {
+            collect_local_names_expr(func, out);
+            for a in args {
+                collect_local_names_expr(a, out);
+            }
+        }
+        Expr::MethodCall { object, args, .. } => {
+            collect_local_names_expr(object, out);
+            for a in args {
+                collect_local_names_expr(a, out);
+            }
+        }
+        Expr::Table { fields } => {
+            for f in fields {
+                match f {
+                    crate::ast::TableField::Sequential(e)
+                    | crate::ast::TableField::Named(_, e) => collect_local_names_expr(e, out),
+                    crate::ast::TableField::Indexed(k, v) => {
+                        collect_local_names_expr(k, out);
+                        collect_local_names_expr(v, out);
+                    }
+                }
+            }
+        }
+        Expr::Ternary { cond, then_expr, else_expr } => {
+            collect_local_names_expr(cond, out);
+            collect_local_names_expr(then_expr, out);
+            collect_local_names_expr(else_expr, out);
+        }
+        _ => {}
+    }
 }
 
 /// Convert a constant to an AST expression.

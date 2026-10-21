@@ -131,6 +131,19 @@ struct Scan {
 /// Insert declarations for captured upvalues that nothing declares.
 /// Returns the names declared, for diagnostics.
 pub fn declare_free_vars(body: &mut Vec<Stat>) -> Vec<String> {
+    declare_free_vars_mode(body, false)
+}
+
+/// `orphan = true` is used for protos that have **no parent binding at all**
+/// (the detached bodies a chunk can report). There is nothing to capture and
+/// nothing to shadow: the proto is never called, and every free read in it is a
+/// name we invented. Declaring all of them keeps such a body self-consistent
+/// instead of leaving `lib`/`script_2`/`upval_N` reads pointing at nil globals.
+pub fn declare_free_vars_orphan(body: &mut Vec<Stat>) -> Vec<String> {
+    declare_free_vars_mode(body, true)
+}
+
+fn declare_free_vars_mode(body: &mut Vec<Stat>, orphan: bool) -> Vec<String> {
     let mut scan = Scan::default();
     scan_stats(body, &mut scan);
 
@@ -195,7 +208,15 @@ pub fn declare_free_vars(body: &mut Vec<Stat>) -> Vec<String> {
     // `undefined_local`, which is the honest outcome: still broken, but broken
     // in a way the tooling reports.
     for n in &scan.read {
-        if scan.bound.contains(n) || is_known_global(n) || !is_generated_name(n) {
+        if scan.bound.contains(n) || is_known_global(n) {
+            continue;
+        }
+        if orphan {
+            // Detached proto: nothing out here to shadow, nothing to capture.
+            free.insert(n.clone());
+            continue;
+        }
+        if !is_generated_name(n) {
             continue;
         }
         // Read only from inside closures -> consistent with a capture.

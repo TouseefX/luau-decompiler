@@ -949,7 +949,7 @@ pub fn decompile_with_plan(
                     .chars()
                     .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
                     .collect();
-                let inner = decompiler::decompile_proto(&mut ctx, p, *idx, 1);
+                let inner = decompiler::decompile_orphan_proto(&mut ctx, p, *idx, 1);
                 let saved = ctx.current_proto_index;
                 ctx.current_proto_index = Some(*idx);
                 let params: Vec<String> = (0..p.num_params)
