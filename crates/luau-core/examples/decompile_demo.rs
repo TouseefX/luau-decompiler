@@ -26,6 +26,11 @@ use luau_core::parser::opcodes::LuauOpcode;
 use luau_core::parser::types::{Chunk, Constant, Proto};
 
 // Canonical Luau opcode bytes (mirror `LuauOpcode as u8`).
+//
+// Named rather than hard-coded so an opcode renumbering in `parser/opcodes.rs`
+// cannot leave this example assembling a chunk with a stale byte. The explicit
+// import is required: examples build as a separate crate, so nothing here is
+// reachable through `crate::`.
 const OP_LOADN: u8 = LuauOpcode::LoadN as u8;
 const OP_GETUPVAL: u8 = LuauOpcode::GetUpval as u8;
 const OP_GETTABLEKS: u8 = LuauOpcode::GetTableKS as u8;

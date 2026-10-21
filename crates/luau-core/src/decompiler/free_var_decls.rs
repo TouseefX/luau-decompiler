@@ -123,6 +123,9 @@ struct Scan {
     read_outside_closure: BTreeSet<String>,
     /// Closure nesting depth during the walk. 0 == chunk top level.
     closure_depth: usize,
+    /// When set, `Expr::Function` bodies are not entered. Used to collect the
+    /// names bound and assigned by ONE function without its nested closures.
+    skip_closures: bool,
 }
 
 /// Insert declarations for captured upvalues that nothing declares.
@@ -202,7 +205,24 @@ pub fn declare_free_vars(body: &mut Vec<Stat>) -> Vec<String> {
         // Otherwise: leave undeclared on purpose, so the defect stays visible.
     }
 
-    let free: Vec<String> = free.into_iter().collect();
+    // Place each admitted name in the innermost function that assigns it —
+    // see the `declare_scoped` comment block for why chunk top is wrong both
+    // semantically and (at 805 names) syntactically.
+    let admitted: BTreeSet<String> = free.clone();
+    let mut placed: BTreeSet<String> = BTreeSet::new();
+    {
+        // `declare_scoped` needs `&mut body`, so the chunk body itself takes
+        // part in the walk; names it declares here are the chunk-top names.
+        let chunk_scope: BTreeSet<String> = BTreeSet::new();
+        declare_scoped(body, &chunk_scope, &admitted, &mut placed);
+    }
+    // Anything the walker did not reach keeps the old chunk-top placement, so
+    // this pass can never leave a previously-declared name undeclared.
+    let free: Vec<String> = free.difference(&placed).cloned().collect();
+    // Report every name this pass declared, wherever it put it, so the
+    // diagnostic log stays truthful about what was fixed.
+    let mut reported: Vec<String> = placed.iter().cloned().collect();
+    reported.extend(free.iter().cloned());
 
     // Emitted here rather than at each mint site because this is the only point
     // that knows which branch hoisted the name -- ASSIGNED names are written
@@ -223,7 +243,7 @@ pub fn declare_free_vars(body: &mut Vec<Stat>) -> Vec<String> {
     }
 
     if free.is_empty() {
-        return free;
+        return reported;
     }
 
     // Chunk top, but after any leading comment header so the banner stays put.
@@ -236,7 +256,193 @@ pub fn declare_free_vars(body: &mut Vec<Stat>) -> Vec<String> {
         insert_at,
         Stat::Local { names: free.clone(), values: Vec::new() },
     );
-    free
+    reported
+}
+
+// ── Scope-local declaration ─────────────────────────────────────────────
+//
+// `declare_free_vars` used to place EVERY admitted name at chunk top. That is
+// the wrong scope, and on a large chunk it is also the wrong SHAPE: 3536
+// protos contributed 805 names to a single `local` statement, and Luau allows
+// only 255 live registers, so the output could not be compiled at all.
+//
+// The placement is also what a reader would expect from the source. An
+// assignment to a name that the function never declares is, in the original
+// program, a `local` at the top of THAT function -- which is exactly where
+// the lifter's register tracker believes it put one. Nested functions then
+// see it as a genuine upvalue, which is how the bytecode captured it.
+//
+// Everything below only ever MOVES a declaration from chunk top into a
+// function; the admission rules are untouched, because the caller passes the
+// chunk-top set as `admitted` and we may only declare names from it. A name
+// the walker fails to reach stays at chunk top, so this cannot regress a file
+// that used to work.
+
+/// Collect the names bound and assigned by ONE function body, excluding the
+/// bodies of any nested closures (those have their own scope).
+fn collect_scope(stats: &[Stat]) -> Scan {
+    let mut out = Scan { skip_closures: true, ..Scan::default() };
+    scan_stats(stats, &mut out);
+    out
+}
+
+/// Visit every closure body directly nested in `stats`, mutably.
+fn visit_closures(stats: &mut [Stat], f: &mut dyn FnMut(&mut Vec<Stat>)) {
+    for s in stats.iter_mut() {
+        match s {
+            Stat::Local { values, .. } => {
+                for v in values {
+                    visit_closures_expr(v, f);
+                }
+            }
+            Stat::Assign { targets, values } => {
+                for t in targets {
+                    visit_closures_expr(t, f);
+                }
+                for v in values {
+                    visit_closures_expr(v, f);
+                }
+            }
+            Stat::If { condition, then_body, elseif_clauses, else_body } => {
+                visit_closures_expr(condition, f);
+                visit_closures(then_body, f);
+                for (c, b) in elseif_clauses.iter_mut() {
+                    visit_closures_expr(c, f);
+                    visit_closures(b, f);
+                }
+                if let Some(b) = else_body {
+                    visit_closures(b, f);
+                }
+            }
+            Stat::While { condition, body } => {
+                visit_closures_expr(condition, f);
+                visit_closures(body, f);
+            }
+            Stat::Repeat { body, condition } => {
+                visit_closures(body, f);
+                visit_closures_expr(condition, f);
+            }
+            Stat::NumericFor { start, stop, step, body, .. } => {
+                visit_closures_expr(start, f);
+                visit_closures_expr(stop, f);
+                if let Some(st) = step {
+                    visit_closures_expr(st, f);
+                }
+                visit_closures(body, f);
+            }
+            Stat::GenericFor { iterators, body, .. } => {
+                for it in iterators {
+                    visit_closures_expr(it, f);
+                }
+                visit_closures(body, f);
+            }
+            Stat::Return { values } => {
+                for v in values {
+                    visit_closures_expr(v, f);
+                }
+            }
+            Stat::DoBlock { body } => visit_closures(body, f),
+            Stat::ExprStat(e) => visit_closures_expr(e, f),
+            Stat::LocalFunction { func, .. } => visit_closures_expr(func, f),
+            Stat::MethodFunction { receiver, func, .. } => {
+                visit_closures_expr(receiver, f);
+                visit_closures_expr(func, f);
+            }
+            Stat::Break | Stat::Continue | Stat::Comment(_) => {}
+        }
+    }
+}
+
+fn visit_closures_expr(expr: &mut Expr, f: &mut dyn FnMut(&mut Vec<Stat>)) {
+    match expr {
+        Expr::Nil
+        | Expr::Bool(_)
+        | Expr::Number(_)
+        | Expr::String(_)
+        | Expr::Varargs
+        | Expr::Name(_)
+        | Expr::Vector(..) => {}
+        Expr::Field { object, .. } => visit_closures_expr(object, f),
+        Expr::Index { object, key } => {
+            visit_closures_expr(object, f);
+            visit_closures_expr(key, f);
+        }
+        Expr::BinOp { left, right, .. } => {
+            visit_closures_expr(left, f);
+            visit_closures_expr(right, f);
+        }
+        Expr::UnOp { operand, .. } => visit_closures_expr(operand, f),
+        Expr::Call { func, args } => {
+            visit_closures_expr(func, f);
+            for a in args {
+                visit_closures_expr(a, f);
+            }
+        }
+        Expr::MethodCall { object, args, .. } => {
+            visit_closures_expr(object, f);
+            for a in args {
+                visit_closures_expr(a, f);
+            }
+        }
+        Expr::Function { body, .. } => f(body),
+        Expr::Table { fields } => {
+            for field in fields.iter_mut() {
+                match field {
+                    TableField::Sequential(e) => visit_closures_expr(e, f),
+                    TableField::Named(_, e) => visit_closures_expr(e, f),
+                    TableField::Indexed(k, v) => {
+                        visit_closures_expr(k, f);
+                        visit_closures_expr(v, f);
+                    }
+                }
+            }
+        }
+        Expr::Ternary { cond, then_expr, else_expr } => {
+            visit_closures_expr(cond, f);
+            visit_closures_expr(then_expr, f);
+            visit_closures_expr(else_expr, f);
+        }
+    }
+}
+
+/// Declare, at the top of each function that assigns them, the names from
+/// `admitted` that the function neither binds nor inherits. Recurses into
+/// nested closures with the accumulated scope. Returns the names placed.
+fn declare_scoped(
+    stats: &mut Vec<Stat>,
+    inherited: &BTreeSet<String>,
+    admitted: &BTreeSet<String>,
+    placed: &mut BTreeSet<String>,
+) {
+    let scope = collect_scope(stats);
+
+    let mut free: Vec<String> = scope
+        .assigned
+        .iter()
+        .filter(|n| admitted.contains(*n))
+        .filter(|n| !scope.bound.contains(*n))
+        .filter(|n| !inherited.contains(*n))
+        .cloned()
+        .collect();
+    free.sort();
+    free.dedup();
+
+    if !free.is_empty() {
+        for n in &free {
+            placed.insert(n.clone());
+        }
+        let insert_at = stats
+            .iter()
+            .position(|s| !matches!(s, Stat::Comment(_)))
+            .unwrap_or(0);
+        stats.insert(insert_at, Stat::Local { names: free.clone(), values: Vec::new() });
+    }
+
+    let mut child_scope: BTreeSet<String> = inherited.union(&scope.bound).cloned().collect();
+    child_scope.extend(free);
+    visit_closures(stats, &mut |body: &mut Vec<Stat>| {
+        declare_scoped(body, &child_scope, admitted, placed);
+    });
 }
 
 // ── Scanning ────────────────────────────────────────────────────────────
@@ -362,6 +568,9 @@ fn scan_expr(expr: &Expr, out: &mut Scan) {
             }
         }
         Expr::Function { params, body, .. } => {
+            if out.skip_closures {
+                return;
+            }
             // Parameters bind INSIDE the closure. Recording them as bound
             // chunk-wide is intentional and conservative: it can only cause
             // us to declare fewer names, never more, so it cannot introduce
@@ -426,7 +635,22 @@ mod tests {
         }];
         let declared = declare_free_vars(&mut body);
         assert_eq!(declared, vec!["v7".to_string()]);
-        assert!(matches!(&body[0], Stat::Local { names, .. } if names == &vec!["v7".to_string()]));
+        // The declaration now goes to the innermost function that assigns the
+        // name, not to chunk top: `f` is the only scope that touches `v7`, and
+        // a chunk-top local would have made 800-odd of these share the main
+        // proto's 200-register budget (see `declare_scoped`).
+        let inner = match &body[0] {
+            Stat::LocalFunction { func, .. } => match func {
+                Expr::Function { body, .. } => body,
+                _ => panic!("expected Function"),
+            },
+            _ => panic!("expected LocalFunction"),
+        };
+        assert!(
+            matches!(&inner[0], Stat::Local { names, .. } if names == &vec!["v7".to_string()]),
+            "expected `local v7` inside f, got {:?}",
+            inner
+        );
     }
 
     /// Writing to a real global must NOT be shadowed — that would turn

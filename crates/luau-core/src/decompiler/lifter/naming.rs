@@ -133,6 +133,29 @@ impl LocalTracker {
         self.declared.insert(reg);
     }
 
+    /// LUAU_PREDECL_TRACE: report a pre-declaration with proto identity.
+    ///
+    /// `pre_declare` marks a register declared WITHOUT emitting a `local`.
+    /// That is only sound when the surrounding code emits the declaration
+    /// (a `for` loop -- the loop variable IS declared by the `for` line --
+    /// or a multi-assignment `local a, b = f()`). Everywhere else it
+    /// manufactures a register that the tracker believes is bound and the
+    /// output never binds, so the next write to it emits a bare `X = ...`
+    /// and Luau reads that as a GLOBAL write. Those bare writes are what
+    /// `free_var_decls` then hoists to chunk top.
+    pub(super) fn pre_declare_trace(proto: &crate::parser::types::Proto, reg: usize, pc: usize, why: &str) {
+        if std::env::var("LUAU_PREDECL_TRACE").is_ok() {
+            eprintln!(
+                "PREDECL\t{}@{}\treg={}\tpc={}\t{}",
+                proto.debug_name.as_deref().unwrap_or("?"),
+                proto.line_defined,
+                reg,
+                pc,
+                why
+            );
+        }
+    }
+
     /// Force a FRESH shadow identity onto a register, overwriting any stale
     /// declaration and name. Returns the name to use. This is for the branch
     /// seed of a register whose PRIOR lifetime is dead (its live value was
@@ -149,6 +172,88 @@ impl LocalTracker {
         self.current_names.insert(reg, name.to_string());
         self.alias_regs.remove(&reg);
         name.to_string()
+    }
+
+    /// Collapsing variant for writes that cannot carry a function value
+    /// (GETGLOBAL / GETIMPORT / GETTABLEKS / NEWTABLE / CALL results).
+    ///
+    /// Those handlers each minted a fresh local whenever `ctx.reg_name` picked
+    /// a different hint for an already-declared register, which is the same
+    /// churn `classify_write_ex` collapses -- and the reason the client chunk
+    /// reached 722 top-level locals against a 173-register proto. Callers that
+    /// CAN store a closure must keep using `classify_write`/`classify_write_ex`,
+    /// because collapsing two closure writes onto one name lets dead-store
+    /// elimination delete the first body.
+    pub(super) fn classify_write_nonfn(&mut self, reg: usize, new_name: &str) -> (WriteKind, String) {
+        if std::env::var("LUAU_NO_SHADOW_COLLAPSE").is_ok() {
+            return self.classify_write(reg, new_name);
+        }
+        if reg >= self.param_count && self.declared.contains(&reg) && !self.alias_regs.contains(&reg) {
+            if let Some(old) = self.current_names.get(&reg).cloned() {
+                if old != "self" {
+                    return (WriteKind::Reassign, old);
+                }
+            }
+        }
+        self.classify_write(reg, new_name)
+    }
+
+    /// Like [`Self::classify_write`], but told what value is being stored.
+    ///
+    /// A register that is reused for a new value is ONE variable in the source
+    /// whose old lifetime has ended -- `local x = a; ...; x = b`. Shadowing it
+    /// into a second local (`local x2 = b`) is also valid Luau, but it costs a
+    /// register for the rest of the function, and Luau allows only 200. On the
+    /// client chunk the main proto declares 173 registers in its bytecode and
+    /// was being emitted with 769 top-level locals, because `ctx.reg_name` is
+    /// PC-scoped and renames the same register on every pass.
+    ///
+    /// Function values are the exception and keep the shadow: a closure that
+    /// is materialised into a named local must keep its own binding, because
+    /// collapsing two closure writes onto one name makes the first a plain
+    /// overwrite that dead-store elimination deletes -- together with the
+    /// proto body it held (measured: 3,568 -> 200 `function` keywords).
+    pub(super) fn classify_write_ex(
+        &mut self,
+        reg: usize,
+        new_name: &str,
+        value: &Expr,
+    ) -> (WriteKind, String) {
+        if std::env::var("LUAU_NO_SHADOW_COLLAPSE").is_ok() {
+            return self.classify_write(reg, new_name);
+        }
+        if matches!(value, Expr::Function { .. }) {
+            return self.classify_write(reg, new_name);
+        }
+        if reg < self.param_count {
+            let existing = self.current_names.get(&reg).cloned();
+            return (WriteKind::Reassign, existing.unwrap_or_else(|| new_name.to_string()));
+        }
+        if !self.declared.contains(&reg) {
+            self.declared.insert(reg);
+            self.current_names.insert(reg, new_name.to_string());
+            return (WriteKind::FirstDecl, new_name.to_string());
+        }
+        if self.alias_regs.contains(&reg) {
+            self.alias_regs.remove(&reg);
+            self.current_names.insert(reg, new_name.to_string());
+            return (WriteKind::FirstDecl, new_name.to_string());
+        }
+        match self.current_names.get(&reg).cloned() {
+            Some(old) if old == new_name => (WriteKind::Reassign, old),
+            Some(old) => {
+                if old == "self" && new_name != "self" {
+                    self.current_names.insert(reg, new_name.to_string());
+                    return (WriteKind::Shadow, new_name.to_string());
+                }
+                self.alias_regs.remove(&reg);
+                (WriteKind::Reassign, old)
+            }
+            None => {
+                self.current_names.insert(reg, new_name.to_string());
+                (WriteKind::Reassign, new_name.to_string())
+            }
+        }
     }
 
     /// The local name currently bound to `reg`, if it holds a live binding.
@@ -201,11 +306,67 @@ impl LocalTracker {
     pub(super) fn classify_write(&mut self, reg: usize, new_name: &str) -> (WriteKind, String) {
         // Params always reassign — the register IS the parameter, never
         // re-declared.  Mirrors `needs_local`'s behavior.
+        //
+        // AND THEY REASSIGN UNDER THEIR OWN NAME.
+        //
+        // This returned `new_name` — the value-shape hint `ctx.reg_name`
+        // mints for whatever value happens to be stored — which breaks the
+        // contract stated on this function and turns a parameter
+        // reassignment into a write to an undeclared identifier:
+        //
+        //     local function Communicate(arg1, arg2)
+        //         if typeof(arg2) ~= "table" then
+        //             tbl2 = {}          -- was `arg2 = {}`
+        //         end
+        //
+        // `tbl2` is a NEWTABLE hint, not a binding. Luau reads the emitted
+        // line as a GLOBAL write: the parameter keeps its old value and a
+        // stray global appears. The value join that should have folded this
+        // to `arg2 = cond and {} or arg2` also rejected it, because the arm
+        // produced an `Assign` rather than a pure temp — which is how one
+        // wrong name cascaded into 858 names hoisted at chunk top.
+        //
+        // `current_names` is seeded for every parameter by `lift_proto_inner`
+        // (it calls `record_name` for each), so the parameter's own name is
+        // available here. `new_name` remains the fallback for the impossible
+        // case where a parameter register was never recorded.
         if reg < self.param_count {
-            return (WriteKind::Reassign, new_name.to_string());
+            let existing = self.current_names.get(&reg).cloned();
+            return (WriteKind::Reassign, existing.unwrap_or_else(|| new_name.to_string()));
         }
         if !self.declared.contains(&reg) {
             self.declared.insert(reg);
+            self.current_names.insert(reg, new_name.to_string());
+            return (WriteKind::FirstDecl, new_name.to_string());
+        }
+        // B0.131 — an ALIAS register has no local of its own.
+        //
+        // `GETUPVAL R(a) U(b)` sets `regs[a] = Name(upval)` and records the
+        // register as an alias: reads of R(a) are really reads of the upvalue
+        // binding, which DOES exist (it is the parent's local or one of this
+        // proto's own hoisted upvalues).  So a read needs no declaration, and
+        // pre-declaring the register was a cheap way to stop the following
+        // SETUPVAL write-back from materialising a shadow.
+        //
+        // But pre-declaring also tells this function that the register has a
+        // BINDING, and it does not: nothing was ever emitted.  When the VM
+        // reuses R(a) for an unrelated value, every branch below classifies
+        // that write as `Shadow` and emits `newname = <value>` — an assignment
+        // to an identifier that was never declared, which Luau reads as a
+        // GLOBAL write.  `free_var_decls` then finds those adrift names in
+        // `scan.assigned` and hoists them to chunk top: 1,017 of the 1,954
+        // bare writes on the client chunk traced back to exactly this site
+        // (and, via the hoist, most of the 805 names over the 255 ceiling).
+        //
+        // A rename here is therefore a genuine FIRST DECLARATION of a local
+        // for this register, not a shadow of an existing one.  Emitting
+        // `local new = value` keeps the value reachable and leaves
+        // `declared`/`current_names` honest, so later writes reassign it.
+        // The self-mutation case (`GETUPVAL/ADDK/SETUPVAL` -> `hits = hits+1`)
+        // never reaches here: the hint equals the alias name, so `old ==
+        // new_name` and the Reassign arm below keeps it writing the upvalue.
+        if self.alias_regs.contains(&reg) {
+            self.alias_regs.remove(&reg);
             self.current_names.insert(reg, new_name.to_string());
             return (WriteKind::FirstDecl, new_name.to_string());
         }
@@ -231,6 +392,15 @@ impl LocalTracker {
                 // Names differ.  Only shadow when BOTH are semantic
                 // (non-`v\d+`).  Otherwise reuse the old name to avoid
                 // counter-bump churn.
+                //
+                // Shadowing is NOT optional here.  Reusing one name for every
+                // lifetime of a register (`F = f1; F = f2`) leaves the two
+                // assignments as plain overwrites, and dead-store elimination
+                // then correctly deletes the first -- but the closure it built
+                // was reachable through the register earlier in the block, and
+                // taking the body with it dropped 3,336 of 3,536 protos
+                // (measured: `function` keyword count 3,568 -> 200).  A fresh
+                // name per lifetime is what keeps those bodies alive.
                 if is_semantic_local_name(&old) && is_semantic_local_name(new_name) {
                     self.current_names.insert(reg, new_name.to_string());
                     (WriteKind::Shadow, new_name.to_string())
@@ -243,10 +413,7 @@ impl LocalTracker {
                     self.current_names.insert(reg, new_name.to_string());
                     (WriteKind::Shadow, new_name.to_string())
                 } else {
-                    // One side is a generic fallback → keep existing name
-                    // so emitted code stays `<existing> = value` (valid
-                    // reassignment to the already-declared local) rather
-                    // than creating a global write to a churned `v{N}`.
+                    // (fallthrough) keep the existing binding
                     (WriteKind::Reassign, old)
                 }
             }

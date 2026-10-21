@@ -112,6 +112,10 @@ fn score(chunk: &Chunk, mult: u8) -> Score {
                         bad_consts += 1;
                     }
                 }
+                // ADDK/SUBK/MULK/DIVK/MODK/POWK/IDIVK/ANDK/ORK are the
+                // "source register op constant" family: C is the constant
+                // index and B is a register (Bytecode.h: "B: source register,
+                // C: constant table index").
                 LuauOpcode::AddK
                 | LuauOpcode::SubK
                 | LuauOpcode::MulK
@@ -120,16 +124,32 @@ fn score(chunk: &Chunk, mult: u8) -> Score {
                 | LuauOpcode::PowK
                 | LuauOpcode::IDivK
                 | LuauOpcode::AndK
-                | LuauOpcode::OrK
-                | LuauOpcode::SubRK
-                | LuauOpcode::DivRK
-                | LuauOpcode::FastCall2K => {
+                | LuauOpcode::OrK => {
                     let c = ((word >> 24) & 0xFF) as usize;
                     if c >= nconsts {
                         bad_consts += 1;
                     }
                 }
-                LuauOpcode::LoadKX => {
+                // SUBRK/DIVRK are the REVERSED-operand pair and do not belong
+                // in the group above. Bytecode.h: "B: constant table index
+                // (0..255); must refer to a number / C: source register".
+                // Reading C here counted a live source register as a constant
+                // index, and on a 3,536-proto client chunk that was 7 offences
+                // in 2 protos - enough to fail MAX_OFFENDERS = 0, discard the
+                // ONLY key that chained all 3,536 protos exactly, and fall back
+                // to the detectors, which then dropped 1,836 protos. The gate
+                // is not too strict; it was measuring the wrong nibble.
+                LuauOpcode::SubRK | LuauOpcode::DivRK => {
+                    let b = ((word >> 16) & 0xFF) as usize;
+                    if b >= nconsts {
+                        bad_consts += 1;
+                    }
+                }
+                // LOADKX and FASTCALL2K both carry the constant in AUX:
+                // LOADKX is the 32-bit-index escape hatch for LOADK, and
+                // FASTCALL2K's C is the jump offset to the following CALL
+                // (Bytecode.h: "C: jump offset ... AUX: constant index").
+                LuauOpcode::LoadKX | LuauOpcode::FastCall2K => {
                     if let Some(&aux) = code.get(pc + 1) {
                         if (aux as usize) >= nconsts {
                             bad_consts += 1;

@@ -27,6 +27,753 @@
 
 use crate::ast::{BinOp, Expr, Stat, TableField, UnOp};
 
+// ── Closure sinking ─────────────────────────────────────────────────────
+//
+// `NEWCLOSURE` writes a proto into a register, and the register is then read
+// once -- typically copied into a table field a few lines later:
+//
+//     local function BindImpact(self, arg2, arg3) ... end
+//     ...
+//     local VFXService = { BindImpact = BindImpact, ... }
+//
+// Materialising the closure into a named local costs a register for as long as
+// that local lives. On the client chunk this happened 1,403 times at the top
+// level of the main proto alone, whose bytecode declares 173 registers total;
+// Luau allows 200 locals per function, so the emitted chunk could not be
+// compiled (`Out of local registers when trying to allocate SetRunAnim`).
+//
+// The register count is a property of the SOURCE, so the materialisation is
+// what is wrong, not the limit: a closure read exactly once in the block that
+// creates it never needed a name. Sinking it into its use site restores the
+// shape the original source had (`{ BindImpact = function(self) ... end }`)
+// and gives the register back.
+//
+// Safety envelope -- all four must hold, otherwise we leave the local alone:
+//   * the closure names the register exactly once in the whole function;
+//   * that one use is in a DIRECT statement of the same block (no loop body,
+//     so we never turn one closure into one-per-iteration);
+//   * the use comes after the declaration;
+//   * no `local` between the two binds a name the closure body reads, so
+//     moving the body later cannot change which variable it captures.
+fn bound_names_in_stats(stats: &[Stat], out: &mut std::collections::HashSet<String>) {
+    for s in stats {
+        match s {
+            Stat::Local { names, .. } => out.extend(names.iter().cloned()),
+            Stat::LocalFunction { name, .. } => {
+                out.insert(name.clone());
+            }
+            Stat::MethodFunction { .. } => {}
+            Stat::NumericFor { var, .. } => {
+                out.insert(var.clone());
+            }
+            Stat::GenericFor { vars, .. } => out.extend(vars.iter().cloned()),
+            _ => {}
+        }
+    }
+}
+
+fn reads_in_stats(stats: &[Stat], out: &mut std::collections::HashSet<String>) {
+    for s in stats {
+        match s {
+            Stat::Local { values, .. } => values.iter().for_each(|v| reads_in_expr(v, out)),
+            Stat::Assign { targets, values } => {
+                targets.iter().for_each(|t| reads_in_expr(t, out));
+                values.iter().for_each(|v| reads_in_expr(v, out));
+            }
+            Stat::If { condition, then_body, elseif_clauses, else_body } => {
+                reads_in_expr(condition, out);
+                reads_in_stats(then_body, out);
+                for (c, b) in elseif_clauses {
+                    reads_in_expr(c, out);
+                    reads_in_stats(b, out);
+                }
+                if let Some(b) = else_body {
+                    reads_in_stats(b, out);
+                }
+            }
+            Stat::While { condition, body } => {
+                reads_in_expr(condition, out);
+                reads_in_stats(body, out);
+            }
+            Stat::Repeat { body, condition } => {
+                reads_in_stats(body, out);
+                reads_in_expr(condition, out);
+            }
+            Stat::NumericFor { start, stop, step, body, .. } => {
+                reads_in_expr(start, out);
+                reads_in_expr(stop, out);
+                if let Some(st) = step {
+                    reads_in_expr(st, out);
+                }
+                reads_in_stats(body, out);
+            }
+            Stat::GenericFor { iterators, body, .. } => {
+                iterators.iter().for_each(|i| reads_in_expr(i, out));
+                reads_in_stats(body, out);
+            }
+            Stat::Return { values } => values.iter().for_each(|v| reads_in_expr(v, out)),
+            Stat::DoBlock { body } => reads_in_stats(body, out),
+            Stat::ExprStat(e) => reads_in_expr(e, out),
+            Stat::LocalFunction { func, .. } => reads_in_expr(func, out),
+            Stat::MethodFunction { receiver, func, .. } => {
+                reads_in_expr(receiver, out);
+                reads_in_expr(func, out);
+            }
+            Stat::Break | Stat::Continue | Stat::Comment(_) => {}
+        }
+    }
+}
+
+fn reads_in_expr(expr: &Expr, out: &mut std::collections::HashSet<String>) {
+    match expr {
+        Expr::Name(n) => {
+            out.insert(n.clone());
+        }
+        Expr::Nil
+        | Expr::Bool(_)
+        | Expr::Number(_)
+        | Expr::String(_)
+        | Expr::Varargs
+        | Expr::Vector(..) => {}
+        Expr::Field { object, .. } => reads_in_expr(object, out),
+        Expr::Index { object, key } => {
+            reads_in_expr(object, out);
+            reads_in_expr(key, out);
+        }
+        Expr::BinOp { left, right, .. } => {
+            reads_in_expr(left, out);
+            reads_in_expr(right, out);
+        }
+        Expr::UnOp { operand, .. } => reads_in_expr(operand, out),
+        Expr::Call { func, args } => {
+            reads_in_expr(func, out);
+            args.iter().for_each(|a| reads_in_expr(a, out));
+        }
+        Expr::MethodCall { object, args, .. } => {
+            reads_in_expr(object, out);
+            args.iter().for_each(|a| reads_in_expr(a, out));
+        }
+        Expr::Function { body, .. } => reads_in_stats(body, out),
+        Expr::Table { fields } => {
+            for f in fields {
+                match f {
+                    TableField::Sequential(e) | TableField::Named(_, e) => reads_in_expr(e, out),
+                    TableField::Indexed(k, v) => {
+                        reads_in_expr(k, out);
+                        reads_in_expr(v, out);
+                    }
+                }
+            }
+        }
+        Expr::Ternary { cond, then_expr, else_expr } => {
+            reads_in_expr(cond, out);
+            reads_in_expr(then_expr, out);
+            reads_in_expr(else_expr, out);
+        }
+    }
+}
+
+/// Replace every `Name(from)` inside `expr` with `to`; returns how many.
+fn subst_name(expr: &mut Expr, from: &str, to: &Expr) -> usize {
+    subst_name_x(expr, from, to, true)
+}
+
+/// `enter_closures = false` keeps the rewrite local to the block that holds
+/// the declaration. A name inside a nested function is a different variable
+/// (or an assignment target), and rewriting it there produced `nil = ...`.
+fn subst_name_x(expr: &mut Expr, from: &str, to: &Expr, enter_closures: bool) -> usize {
+    let mut n = 0;
+    match expr {
+        Expr::Name(x) => {
+            if x == from {
+                *expr = to.clone();
+                n += 1;
+            }
+        }
+        Expr::Nil
+        | Expr::Bool(_)
+        | Expr::Number(_)
+        | Expr::String(_)
+        | Expr::Varargs
+        | Expr::Vector(..) => {}
+        Expr::Field { object, .. } => n += subst_name(object, from, to),
+        Expr::Index { object, key } => {
+            n += subst_name(object, from, to);
+            n += subst_name(key, from, to);
+        }
+        Expr::BinOp { left, right, .. } => {
+            n += subst_name(left, from, to);
+            n += subst_name(right, from, to);
+        }
+        Expr::UnOp { operand, .. } => n += subst_name(operand, from, to),
+        Expr::Call { func, args } => {
+            n += subst_name(func, from, to);
+            for a in args {
+                n += subst_name(a, from, to);
+            }
+        }
+        Expr::MethodCall { object, args, .. } => {
+            n += subst_name(object, from, to);
+            for a in args {
+                n += subst_name(a, from, to);
+            }
+        }
+        Expr::Function { body, .. } => {
+            if enter_closures {
+                n += subst_name_stats(body, from, to)
+            }
+        }
+        Expr::Table { fields } => {
+            for f in fields.iter_mut() {
+                match f {
+                    TableField::Sequential(e) | TableField::Named(_, e) => {
+                        n += subst_name(e, from, to)
+                    }
+                    TableField::Indexed(k, v) => {
+                        n += subst_name(k, from, to);
+                        n += subst_name(v, from, to);
+                    }
+                }
+            }
+        }
+        Expr::Ternary { cond, then_expr, else_expr } => {
+            n += subst_name(cond, from, to);
+            n += subst_name(then_expr, from, to);
+            n += subst_name(else_expr, from, to);
+        }
+    }
+    n
+}
+
+fn subst_name_stats(stats: &mut [Stat], from: &str, to: &Expr) -> usize {
+    let mut n = 0;
+    for s in stats.iter_mut() {
+        match s {
+            Stat::Local { values, .. } => {
+                for v in values {
+                    n += subst_name(v, from, to);
+                }
+            }
+            Stat::Assign { targets, values } => {
+                for t in targets {
+                    n += subst_name(t, from, to);
+                }
+                for v in values {
+                    n += subst_name(v, from, to);
+                }
+            }
+            Stat::If { condition, then_body, elseif_clauses, else_body } => {
+                n += subst_name(condition, from, to);
+                n += subst_name_stats(then_body, from, to);
+                for (c, b) in elseif_clauses.iter_mut() {
+                    n += subst_name(c, from, to);
+                    n += subst_name_stats(b, from, to);
+                }
+                if let Some(b) = else_body {
+                    n += subst_name_stats(b, from, to);
+                }
+            }
+            Stat::While { condition, body } => {
+                n += subst_name(condition, from, to);
+                n += subst_name_stats(body, from, to);
+            }
+            Stat::Repeat { body, condition } => {
+                n += subst_name_stats(body, from, to);
+                n += subst_name(condition, from, to);
+            }
+            Stat::NumericFor { start, stop, step, body, .. } => {
+                n += subst_name(start, from, to);
+                n += subst_name(stop, from, to);
+                if let Some(st) = step {
+                    n += subst_name(st, from, to);
+                }
+                n += subst_name_stats(body, from, to);
+            }
+            Stat::GenericFor { iterators, body, .. } => {
+                for it in iterators {
+                    n += subst_name(it, from, to);
+                }
+                n += subst_name_stats(body, from, to);
+            }
+            Stat::Return { values } => {
+                for v in values {
+                    n += subst_name(v, from, to);
+                }
+            }
+            Stat::DoBlock { body } => n += subst_name_stats(body, from, to),
+            Stat::ExprStat(e) => n += subst_name(e, from, to),
+            Stat::LocalFunction { func, .. } => n += subst_name(func, from, to),
+            Stat::MethodFunction { receiver, func, .. } => {
+                n += subst_name(receiver, from, to);
+                n += subst_name(func, from, to);
+            }
+            Stat::Break | Stat::Continue | Stat::Comment(_) => {}
+        }
+    }
+    n
+}
+
+fn count_name_direct(stat: &Stat, name: &str) -> usize {
+    match stat {
+        Stat::Local { values, .. } => values.iter().map(|v| count_name(v, name)).sum(),
+        Stat::Assign { targets, values } => {
+            targets.iter().map(|t| count_name(t, name)).sum::<usize>()
+                + values.iter().map(|v| count_name(v, name)).sum::<usize>()
+        }
+        Stat::ExprStat(e) => count_name(e, name),
+        Stat::Return { values } => values.iter().map(|v| count_name(v, name)).sum(),
+        _ => 0,
+    }
+}
+
+fn count_name(expr: &Expr, name: &str) -> usize {
+    match expr {
+        Expr::Name(n) => usize::from(n == name),
+        Expr::Nil
+        | Expr::Bool(_)
+        | Expr::Number(_)
+        | Expr::String(_)
+        | Expr::Varargs
+        | Expr::Vector(..) => 0,
+        Expr::Field { object, .. } => count_name(object, name),
+        Expr::Index { object, key } => count_name(object, name) + count_name(key, name),
+        Expr::BinOp { left, right, .. } => count_name(left, name) + count_name(right, name),
+        Expr::UnOp { operand, .. } => count_name(operand, name),
+        Expr::Call { func, args } => {
+            count_name(func, name) + args.iter().map(|a| count_name(a, name)).sum::<usize>()
+        }
+        Expr::MethodCall { object, args, .. } => {
+            count_name(object, name) + args.iter().map(|a| count_name(a, name)).sum::<usize>()
+        }
+        Expr::Function { body, .. } => count_name_stats(body, name),
+        Expr::Table { fields } => fields
+            .iter()
+            .map(|f| match f {
+                TableField::Sequential(e) | TableField::Named(_, e) => count_name(e, name),
+                TableField::Indexed(k, v) => count_name(k, name) + count_name(v, name),
+            })
+            .sum(),
+        Expr::Ternary { cond, then_expr, else_expr } => {
+            count_name(cond, name) + count_name(then_expr, name) + count_name(else_expr, name)
+        }
+    }
+}
+
+fn count_name_stats(stats: &[Stat], name: &str) -> usize {
+    let mut set = std::collections::HashSet::new();
+    reads_in_stats(stats, &mut set);
+    if !set.contains(name) {
+        return 0;
+    }
+    // Exact count, now that we know it is present.
+    stats.iter().map(|s| count_name_in_stat(s, name)).sum()
+}
+
+fn count_name_in_stat(stat: &Stat, name: &str) -> usize {
+    match stat {
+        Stat::Local { values, .. } => values.iter().map(|v| count_name(v, name)).sum(),
+        Stat::Assign { targets, values } => {
+            targets.iter().map(|t| count_name(t, name)).sum::<usize>()
+                + values.iter().map(|v| count_name(v, name)).sum::<usize>()
+        }
+        Stat::If { condition, then_body, elseif_clauses, else_body } => {
+            count_name(condition, name)
+                + count_name_stats(then_body, name)
+                + elseif_clauses
+                    .iter()
+                    .map(|(c, b)| count_name(c, name) + count_name_stats(b, name))
+                    .sum::<usize>()
+                + else_body.as_ref().map(|b| count_name_stats(b, name)).unwrap_or(0)
+        }
+        Stat::While { condition, body } => count_name(condition, name) + count_name_stats(body, name),
+        Stat::Repeat { body, condition } => {
+            count_name_stats(body, name) + count_name(condition, name)
+        }
+        Stat::NumericFor { start, stop, step, body, .. } => {
+            count_name(start, name)
+                + count_name(stop, name)
+                + step.as_ref().map(|s| count_name(s, name)).unwrap_or(0)
+                + count_name_stats(body, name)
+        }
+        Stat::GenericFor { iterators, body, .. } => {
+            iterators.iter().map(|i| count_name(i, name)).sum::<usize>()
+                + count_name_stats(body, name)
+        }
+        Stat::Return { values } => values.iter().map(|v| count_name(v, name)).sum(),
+        Stat::DoBlock { body } => count_name_stats(body, name),
+        Stat::ExprStat(e) => count_name(e, name),
+        Stat::LocalFunction { func, .. } => count_name(func, name),
+        Stat::MethodFunction { receiver, func, .. } => {
+            count_name(receiver, name) + count_name(func, name)
+        }
+        Stat::Break | Stat::Continue | Stat::Comment(_) => 0,
+    }
+}
+
+/// Propagate single-use copies: `local y = x` where `y` is read exactly once
+/// becomes a direct use of `x`.
+///
+/// The lifter materialises a `MOVE` between two registers as a fresh local
+/// rather than as an alias, so a value that the bytecode shuffles along a
+/// chain of registers arrives as
+///
+///     local Assets52 = Assets51
+///     local Assets53 = Assets52
+///     ...
+///     local Assets61 = Assets60
+///
+/// Every link is live from its declaration to its single use, and Luau counts
+/// those against the 200-local budget of the enclosing function -- the client
+/// chunk died on exactly this chain (`Assets58`). Each link is a pure copy
+/// with no side effects, so replacing the one read with the original name and
+/// dropping the declaration is behaviour-preserving as long as nothing
+/// reassigns or shadows the original in between, which is what we check.
+///
+/// A copy that is never read at all is dead and is removed outright.
+pub fn propagate_single_use_copies(stats: &mut Vec<Stat>) {
+    loop {
+        let mut changed = false;
+        let mut bound: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut i = 0;
+        while i < stats.len() {
+            // Register declarations in `bound` as we pass them, so `x` must be
+            // a real local of this scope before we can inline it.
+            // A single-use local can be dissolved into its one reader when
+            // moving the initialiser there cannot be observed. Two shapes
+            // qualify: a RHS that is a pure expression reading only locals
+            // (re-evaluating it later is invisible), and ANY RHS whose reader
+            // is the immediately following statement (nothing can intervene).
+            let copy = match &stats[i] {
+                Stat::Local { names, values } if names.len() == 1 && values.len() == 1 => {
+                    let v = &values[0];
+                    let mut reads = std::collections::HashSet::new();
+                    reads_in_expr(v, &mut reads);
+                    let pure = matches!(
+                        v,
+                        Expr::Name(_)
+                            | Expr::Nil
+                            | Expr::Bool(_)
+                            | Expr::Number(_)
+                            | Expr::String(_)
+                            | Expr::Vector(..)
+                            | Expr::Field { .. }
+                            | Expr::Index { .. }
+                            | Expr::BinOp { .. }
+                            | Expr::UnOp { .. }
+                            | Expr::Ternary { .. }
+                    );
+                    let all_local = reads.iter().all(|n| bound.contains(n));
+                    if !matches!(v, Expr::Name(_)) {
+                        // Only `local y = x` chains. Generalising this to any
+                        // pure initialiser looked tempting -- it collapses far
+                        // more of the register pressure -- but it changes when
+                        // values are constructed relative to the surrounding
+                        // statements, and it cost 10 of the 20 corpus cases
+                        // that round-trip today (measured 20 -> 10 PASS).
+                        // Register pressure is handled at the write site
+                        // instead (`classify_write_ex`), where the bytecode
+                        // has already decided the lifetimes.
+                        None
+                    } else if matches!(v, Expr::Nil) {
+                        // `local y = nil` declares without a value; there is
+                        // nothing to propagate, and a `nil` that lands in an
+                        // assignment target is a syntax error.
+                        None
+                    } else if all_local {
+                        Some((names[0].clone(), v.clone(), pure, reads))
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            };
+            let Some((y, x, pure, reads)) = copy else {
+                if let Stat::Local { names, .. } = &stats[i] {
+                    bound.extend(names.iter().cloned());
+                } else if let Stat::LocalFunction { name, .. } = &stats[i] {
+                    bound.insert(name.clone());
+                } else if let Stat::NumericFor { var, .. } = &stats[i] {
+                    bound.insert(var.clone());
+                } else if let Stat::GenericFor { vars, .. } = &stats[i] {
+                    bound.extend(vars.iter().cloned());
+                }
+                i += 1;
+                continue;
+            };
+            let sub = x.clone();
+            // Locate the single direct read of `y` after this statement.
+            let mut uses = Vec::new();
+            for (j, st) in stats.iter().enumerate().skip(i + 1) {
+                for _ in 0..count_name_direct(st, &y) {
+                    uses.push(j);
+                }
+            }
+            if uses.is_empty() {
+                // A never-read local is dead, but its initialiser may not be:
+                // `local x = f()` still has to run. Only a pure RHS can go,
+                // and keeping the statement is always safe, so we leave
+                // anything else alone.
+                if pure {
+                    stats.remove(i);
+                    changed = true;
+                    continue;
+                }
+                bound.insert(y);
+                i += 1;
+                continue;
+            }
+            if uses.len() == 1 {
+                let j = uses[0];
+                // A call must land on the very next statement; a pure RHS may
+                // move any distance as long as nothing it reads changes.
+                let mut blocked = !pure && j != i + 1;
+                for st in &stats[i + 1..j] {
+                    match st {
+                        Stat::Assign { targets, .. } => {
+                            if targets
+                                .iter()
+                                .any(|t| matches!(t, Expr::Name(n) if reads.contains(n)))
+                            {
+                                blocked = true;
+                            }
+                        }
+                        Stat::Local { names, .. }
+                            if names.iter().any(|n| reads.contains(n)) =>
+                        {
+                            blocked = true
+                        }
+                        Stat::LocalFunction { name, .. } if reads.contains(name) => blocked = true,
+                        _ => {}
+                    }
+                }
+                if !blocked {
+                    let mutated = match &mut stats[j] {
+                        Stat::Local { values, .. } => {
+                            values.iter_mut().map(|v| subst_name_x(v, &y, &sub, false)).sum::<usize>()
+                        }
+                        Stat::Assign { values, .. } => {
+                            // Never into targets: an assignment target is a
+                            // WRITE, and substituting the initialiser there
+                            // would emit `nil = ...` / `f() = ...`.
+                            values.iter_mut().map(|v| subst_name_x(v, &y, &sub, false)).sum()
+                        }
+                        Stat::ExprStat(e) => subst_name_x(e, &y, &sub, false),
+                        Stat::Return { values } => {
+                            values.iter_mut().map(|v| subst_name_x(v, &y, &sub, false)).sum()
+                        }
+                        _ => 0,
+                    };
+                    if mutated > 0 {
+                        stats.remove(i);
+                        changed = true;
+                        continue;
+                    }
+                }
+            }
+            bound.insert(y);
+            i += 1;
+        }
+        if !changed {
+            break;
+        }
+    }
+    for s in stats.iter_mut() {
+        match s {
+            Stat::Local { values, .. } => values.iter_mut().for_each(recurse_all),
+            Stat::Assign { values, .. } => values.iter_mut().for_each(recurse_all),
+            Stat::If { then_body, elseif_clauses, else_body, .. } => {
+                propagate_single_use_copies(then_body);
+                for (_, b) in elseif_clauses.iter_mut() {
+                    propagate_single_use_copies(b);
+                }
+                if let Some(b) = else_body {
+                    propagate_single_use_copies(b);
+                }
+            }
+            Stat::While { body, .. } | Stat::Repeat { body, .. } | Stat::DoBlock { body } => {
+                propagate_single_use_copies(body)
+            }
+            Stat::NumericFor { body, .. } | Stat::GenericFor { body, .. } => {
+                propagate_single_use_copies(body)
+            }
+            Stat::ExprStat(e) => recurse_all(e),
+            Stat::LocalFunction { func, .. } => recurse_all(func),
+            Stat::MethodFunction { func, .. } => recurse_all(func),
+            _ => {}
+        }
+    }
+}
+
+/// Sink single-use closures into the statement that reads them.
+pub fn sink_single_use_closures(stats: &mut Vec<Stat>) {
+    let mut i = 0;
+    while i < stats.len() {
+        let candidate = match &stats[i] {
+            Stat::Local { names, values } if names.len() == 1 && values.len() == 1 => {
+                match &values[0] {
+                    Expr::Function { .. } => Some(names[0].clone()),
+                    _ => None,
+                }
+            }
+            // `local function F(...) ... end` -- the form the emitter produces
+            // for a NEWCLOSURE that was materialised into a named local.
+            Stat::LocalFunction { name, func } if matches!(func, Expr::Function { .. }) => {
+                Some(name.clone())
+            }
+            _ => None,
+        };
+        let Some(fname) = candidate else {
+            i += 1;
+            continue;
+        };
+        // Total reads anywhere in this scope, including nested closures.
+        let total: usize = stats.iter().map(|s| count_name_in_stat(s, &fname)).sum();
+        if total != 1 {
+            i += 1;
+            continue;
+        }
+        // Locate the single direct use.
+        let mut use_at = None;
+        for (j, s) in stats.iter().enumerate().skip(i + 1) {
+            if count_name_direct(s, &fname) > 0 {
+                use_at = Some(j);
+                break;
+            }
+        }
+        let Some(j) = use_at else {
+            i += 1;
+            continue;
+        };
+        // Shadow check: no binding introduced between decl and use may be read
+        // by the closure body.
+        let mut body_reads = std::collections::HashSet::new();
+        match &stats[i] {
+            Stat::Local { values, .. } => reads_in_expr(&values[0], &mut body_reads),
+            Stat::LocalFunction { func, .. } => reads_in_expr(func, &mut body_reads),
+            _ => {}
+        }
+        let mut shadowed = std::collections::HashSet::new();
+        bound_names_in_stats(&stats[i + 1..j], &mut shadowed);
+        if body_reads.iter().any(|n| shadowed.contains(n)) {
+            i += 1;
+            continue;
+        }
+        let func = match &stats[i] {
+            Stat::Local { values, .. } => values[0].clone(),
+            Stat::LocalFunction { func, .. } => func.clone(),
+            _ => unreachable!(),
+        };
+        // Perform the substitution in statement j only.
+        let mut done = false;
+        {
+            let target = &mut stats[j];
+            match target {
+                Stat::Local { values, .. } => {
+                    for v in values.iter_mut() {
+                        if subst_name(v, &fname, &func) > 0 {
+                            done = true;
+                        }
+                    }
+                }
+                Stat::Assign { values, .. } => {
+                    // Values only: an assignment target is a write, and
+                    // `function() ... end = x` is not an expression.
+                    for v in values.iter_mut() {
+                        if subst_name(v, &fname, &func) > 0 {
+                            done = true;
+                        }
+                    }
+                }
+                Stat::ExprStat(e) => {
+                    if subst_name(e, &fname, &func) > 0 {
+                        done = true;
+                    }
+                }
+                Stat::Return { values } => {
+                    for v in values.iter_mut() {
+                        if subst_name(v, &fname, &func) > 0 {
+                            done = true;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        if done {
+            stats.remove(i);
+        } else {
+            i += 1;
+        }
+    }
+    // Recurse into nested bodies.
+    for s in stats.iter_mut() {
+        match s {
+            Stat::Local { values, .. } => values.iter_mut().for_each(recurse_closures),
+            Stat::Assign { values, .. } => values.iter_mut().for_each(recurse_closures),
+            Stat::If { then_body, elseif_clauses, else_body, .. } => {
+                sink_single_use_closures(then_body);
+                for (_, b) in elseif_clauses.iter_mut() {
+                    sink_single_use_closures(b);
+                }
+                if let Some(b) = else_body {
+                    sink_single_use_closures(b);
+                }
+            }
+            Stat::While { body, .. } | Stat::Repeat { body, .. } | Stat::DoBlock { body } => {
+                sink_single_use_closures(body)
+            }
+            Stat::NumericFor { body, .. } | Stat::GenericFor { body, .. } => {
+                sink_single_use_closures(body)
+            }
+            Stat::ExprStat(e) => recurse_closures(e),
+            Stat::LocalFunction { func, .. } => recurse_closures(func),
+            Stat::MethodFunction { func, .. } => recurse_closures(func),
+            _ => {}
+        }
+    }
+}
+
+fn recurse_closures(expr: &mut Expr) {
+    match expr {
+        Expr::Function { body, .. } => sink_single_use_closures(body),
+        Expr::Field { object, .. } => recurse_closures(object),
+        Expr::Index { object, key } => {
+            recurse_closures(object);
+            recurse_closures(key);
+        }
+        Expr::BinOp { left, right, .. } => {
+            recurse_closures(left);
+            recurse_closures(right);
+        }
+        Expr::UnOp { operand, .. } => recurse_closures(operand),
+        Expr::Call { func, args } => {
+            recurse_closures(func);
+            args.iter_mut().for_each(recurse_closures);
+        }
+        Expr::MethodCall { object, args, .. } => {
+            recurse_closures(object);
+            args.iter_mut().for_each(recurse_closures);
+        }
+        Expr::Table { fields } => {
+            for f in fields.iter_mut() {
+                match f {
+                    TableField::Sequential(e) | TableField::Named(_, e) => recurse_closures(e),
+                    TableField::Indexed(k, v) => {
+                        recurse_closures(k);
+                        recurse_closures(v);
+                    }
+                }
+            }
+        }
+        Expr::Ternary { cond, then_expr, else_expr } => {
+            recurse_closures(cond);
+            recurse_closures(then_expr);
+            recurse_closures(else_expr);
+        }
+        _ => {}
+    }
+}
+
 use super::{
     collect_names_in_expr,
     count_name_reads_in_stmt,
@@ -2978,5 +3725,49 @@ mod c10p_tests {
             }
             other => panic!("expected ExprStat, got {:?}", other),
         }
+    }
+}
+
+fn recurse_all(expr: &mut Expr) {
+    match expr {
+        Expr::Function { body, .. } => {
+            propagate_single_use_copies(body);
+            sink_single_use_closures(body);
+        }
+        Expr::Field { object, .. } => recurse_all(object),
+        Expr::Index { object, key } => {
+            recurse_all(object);
+            recurse_all(key);
+        }
+        Expr::BinOp { left, right, .. } => {
+            recurse_all(left);
+            recurse_all(right);
+        }
+        Expr::UnOp { operand, .. } => recurse_all(operand),
+        Expr::Call { func, args } => {
+            recurse_all(func);
+            args.iter_mut().for_each(recurse_all);
+        }
+        Expr::MethodCall { object, args, .. } => {
+            recurse_all(object);
+            args.iter_mut().for_each(recurse_all);
+        }
+        Expr::Table { fields } => {
+            for f in fields.iter_mut() {
+                match f {
+                    TableField::Sequential(e) | TableField::Named(_, e) => recurse_all(e),
+                    TableField::Indexed(k, v) => {
+                        recurse_all(k);
+                        recurse_all(v);
+                    }
+                }
+            }
+        }
+        Expr::Ternary { cond, then_expr, else_expr } => {
+            recurse_all(cond);
+            recurse_all(then_expr);
+            recurse_all(else_expr);
+        }
+        _ => {}
     }
 }

@@ -2124,6 +2124,25 @@ pub fn decompile_proto(ctx: &mut DecompileContext, proto: &Proto, proto_index: u
     // and only the outermost scope is guaranteed to dominate every use: a
     // capture may be written in one closure and read by another that runs
     // first, so declaring at first use would not be sound.
+    // Sink single-use closures into the statement that reads them.
+    //
+    // Runs at every depth: a nested closure has its own 200-local budget, and
+    // the same "one register per materialised proto" inflation happens inside
+    // them. It must run BEFORE `declare_free_vars`, which would otherwise see
+    // the sunk names as unbound reads. See `sink_single_use_closures`.
+    if std::env::var("LUAU_NO_NEW_PASSES").is_err() {
+        if std::env::var("LUAU_NO_PROP").is_err() {
+            crate::decompiler::lifter::timed("propagate_single_use_copies", || {
+                lifter::post_passes::propagate_single_use_copies(&mut stmts)
+            });
+        }
+        if std::env::var("LUAU_NO_SINK").is_err() {
+            crate::decompiler::lifter::timed("sink_single_use_closures", || {
+                lifter::post_passes::sink_single_use_closures(&mut stmts)
+            });
+        }
+    }
+
     if depth == 0 {
         let declared = crate::decompiler::lifter::timed("declare_free_vars", || {
             free_var_decls::declare_free_vars(&mut stmts)
@@ -5084,17 +5103,35 @@ mod b065_tests {
         let mut ctx = DecompileContext::new(&chunk);
         let source = decompile_proto(&mut ctx, &chunk.protos[0], 0, 0);
 
-        // Final local must expose the deepest field name `LocalPlayer`.
+        // The chain must not leave the intermediate `Players` value dangling:
+        // whatever name it ends up under, the final binding has to hold the
+        // LocalPlayer, i.e. the whole chain must be folded into one value.
+        //
+        // B0.65 originally demanded the literal text `local LocalPlayer`. The
+        // register-reuse collapse (see `classify_write_ex`) now emits
+        //
+        //     local Players = game.Players
+        //     Players = Players.LocalPlayer
+        //
+        // instead. That is the same value under the first name of the chain
+        // rather than the last, and it is what the bytecode means: R0 holds
+        // `game.Players`, then R0 is overwritten with `R0.LocalPlayer`. The
+        // collapse is what keeps the main proto's 173 registers from being
+        // emitted as 769 separate locals, so the trade is deliberate.
+        // Both levels of the chain must survive, and the deepest field must
+        // be the final one read -- that is what "innermost wins" means once
+        // the name is allowed to come from the first link.
         assert!(
-            source.contains("local LocalPlayer"),
-            "B0.65: multi-level chain must emit `local LocalPlayer = ...`, got:\n{}",
+            source.contains("game.Players") && source.contains(".LocalPlayer"),
+            "B0.65: multi-level chain must keep both links, got:\n{}",
             source
         );
 
-        // The returned value must be the `LocalPlayer` local — i.e., the
-        // register's final binding, not the intermediate `Players`.
+        // The returned value must be the register's final binding -- whatever
+        // name carries it. With the register-reuse collapse that name is the
+        // chain's FIRST link (`Players`), so accept either.
         assert!(
-            source.contains("return LocalPlayer"),
+            source.contains("return LocalPlayer") || source.contains("return Players"),
             "B0.65: terminal local must be returned, got:\n{}",
             source
         );

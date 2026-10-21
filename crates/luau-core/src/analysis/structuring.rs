@@ -214,8 +214,6 @@ pub(crate) fn structure_block_subset(
             let fallthrough = block.successors[0];
             let branch = block.successors[1];
             let merge = cfg.find_merge_point(fallthrough, branch);
-            let then_blocks = collect_region_blocks(cfg, fallthrough, merge, &handled);
-            let else_blocks = collect_region_blocks(cfg, branch, merge, &handled);
 
             // Collect blocks in each branch
             let then_blocks = collect_region_blocks(cfg, fallthrough, merge, &handled);

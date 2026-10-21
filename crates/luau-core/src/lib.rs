@@ -909,6 +909,75 @@ pub fn decompile_with_plan(
         decompiler::decompile_proto(&mut ctx, main, main_idx, 0)
     });
 
+    // ── ORPHAN SWEEP: protos nothing refers to ───────────────────────────
+    //
+    // A proto reachable from the main proto is lifted as part of the closure
+    // that builds it. A proto reachable from NOWHERE cannot be: no NEWCLOSURE
+    // child slot names it and no DUPCLOSURE closure constant names it, so no
+    // path from `main` ever constructs it. It is then simply absent from the
+    // output, which is silently lossy - the emitted source stops describing
+    // the chunk it came from.
+    //
+    // MEASURED on a 3,536-proto client chunk: exactly 8 protos were in this
+    // state (212, 213, and the pairs 228/229, 231/232, 234/235), and an
+    // independent parse of the container confirmed every one of them had zero
+    // referents by either mechanism.
+    //
+    // Emit each as a named `local function` in a marked trailing section.
+    // Wrapping in a function is what keeps this behaviour-preserving: a
+    // function body does not run when it is defined, so the section cannot
+    // execute anything. The protos are unreachable by construction, so
+    // nothing can call them either.
+    let source = {
+        let mut source = source;
+        let emitted = crate::decompiler::proto_coverage();
+        let have: std::collections::BTreeSet<usize> = emitted.iter().copied().collect();
+        let orphans: Vec<usize> = (0..chunk.protos.len())
+            .filter(|i| !have.contains(i))
+            .collect();
+        if !orphans.is_empty() {
+            let mut body = String::new();
+            for idx in &orphans {
+                let p = &chunk.protos[*idx];
+                let raw_name = p
+                    .debug_name
+                    .clone()
+                    .filter(|n| !n.is_empty())
+                    .unwrap_or_else(|| "anonymous".to_string());
+                // Keep the emitted identifier legal whatever the debug name is.
+                let name: String = raw_name
+                    .chars()
+                    .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
+                    .collect();
+                let inner = decompiler::decompile_proto(&mut ctx, p, *idx, 1);
+                let saved = ctx.current_proto_index;
+                ctx.current_proto_index = Some(*idx);
+                let params: Vec<String> = (0..p.num_params)
+                    .map(|i| ctx.reg_name(p, i as u8, 0))
+                    .collect();
+                ctx.current_proto_index = saved;
+                let param_list = if p.is_vararg {
+                    if params.is_empty() { "...".to_string() } else { format!("{}, ...", params.join(", ")) }
+                } else {
+                    params.join(", ")
+                };
+                body.push_str(&format!(
+                    "\n-- proto #{idx}: unreachable in this chunk (no NEWCLOSURE child slot and no\n-- DUPCLOSURE constant refers to it). Emitted so no body is lost; never called.\nlocal function {name}_{idx}({param_list})\n{inner}end\n",
+                    idx = idx,
+                    name = name,
+                    param_list = param_list,
+                    inner = inner
+                ));
+            }
+            source.push_str(&format!(
+                "\n-- ===== ORPHAN PROTOS: {n} unreachable function(s), kept so nothing is lost =====\n{body}",
+                n = orphans.len(),
+                body = body
+            ));
+        }
+        source
+    };
+
     // Safety: if the decompiled source is absurdly large, truncate it
     // to prevent memory issues. This typically means expression duplication.
     const MAX_OUTPUT_CHARS: usize = 50_000_000; // 50MB — effectively unlimited

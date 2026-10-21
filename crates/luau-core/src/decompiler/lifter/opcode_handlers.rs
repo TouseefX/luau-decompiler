@@ -2005,6 +2005,7 @@ pub(super) fn lift_instruction_range(
                 // `local hits = hits + 1` — a shadow that made the following
                 // `hits = hits` a self-assign, which dead-store elimination
                 // deleted, silently dropping the upvalue write entirely.
+                LocalTracker::pre_declare_trace(proto, a, pc, "vh:2008");
                 locals.pre_declare(a);
                 locals.record_alias_name(a, &name);
             }
@@ -2694,7 +2695,7 @@ pub(super) fn lift_instruction_range(
                     // Phase B0.49: classify_write for shadow-on-rename.
                     let new_name = ctx.reg_name(proto, a as u8, pc);
                     let empty = Expr::Table { fields: vec![] };
-                    let (kind, name) = locals.classify_write(a, &new_name);
+                    let (kind, name) = locals.classify_write_nonfn(a, &new_name);
                     match kind {
                         WriteKind::FirstDecl | WriteKind::Shadow => {
                             stmts.push(Stat::Local {
@@ -2744,7 +2745,7 @@ pub(super) fn lift_instruction_range(
                 // `return {a=1, b=2}` tables still inline. See table_needs_binding.
                 if pc <= 1 || table_needs_binding(code, pc, a) {
                     let new_name = ctx.reg_name(proto, a as u8, pc);
-                    let (kind, name) = locals.classify_write(a, &new_name);
+                    let (kind, name) = locals.classify_write_nonfn(a, &new_name);
                     match kind {
                         WriteKind::FirstDecl | WriteKind::Shadow => {
                             stmts.push(Stat::Local {
@@ -3606,7 +3607,7 @@ pub(super) fn lift_instruction_range(
                     _ => {
                         // Phase B0.49: classify_write for shadow-on-rename.
                         let new_oname = ctx.reg_name(proto, (a + 1) as u8, pc);
-                        let (kind, oname) = locals.classify_write(a + 1, &new_oname);
+                        let (kind, oname) = locals.classify_write_nonfn(a + 1, &new_oname);
                         match kind {
                             WriteKind::FirstDecl | WriteKind::Shadow => {
                                 stmts.push(Stat::Local {
@@ -3643,7 +3644,7 @@ pub(super) fn lift_instruction_range(
                         let tbl_expr = reg_expr(regs, a);
                         // Phase B0.49: classify_write for shadow-on-rename.
                         let new_name = ctx.reg_name(proto, a as u8, pc);
-                        let (kind, name) = locals.classify_write(a, &new_name);
+                        let (kind, name) = locals.classify_write_nonfn(a, &new_name);
                         match kind {
                             WriteKind::FirstDecl | WriteKind::Shadow => {
                                 stmts.push(Stat::Local {
@@ -4083,7 +4084,7 @@ pub(super) fn lift_instruction_range(
                             // read minted `v2`).
                         } else {
                             // Phase B0.49: classify_write for shadow-on-rename.
-                            let (kind, name) = locals.classify_write(a, &new_name);
+                            let (kind, name) = locals.classify_write_nonfn(a, &new_name);
                             match kind {
                                 WriteKind::FirstDecl | WriteKind::Shadow => {
                                     stmts.push(Stat::Local {
@@ -4120,6 +4121,7 @@ pub(super) fn lift_instruction_range(
                         let any_new = (0..names.len()).any(|i| !locals.declared.contains(&(a + i)));
                         if any_new {
                             for i in 0..names.len() {
+                                LocalTracker::pre_declare_trace(proto, a + i, pc, "multiret");
                                 locals.pre_declare(a + i);
                                 // Phase B0.49: keep current_names in sync so
                                 // future single-reg writes can shadow when the
@@ -4149,7 +4151,7 @@ pub(super) fn lift_instruction_range(
                     // expression is not duplicated at every use site.
                     // Phase B0.49: classify_write for shadow-on-rename.
                     let new_name = ctx.reg_name(proto, a as u8, pc);
-                    let (kind, name) = locals.classify_write(a, &new_name);
+                    let (kind, name) = locals.classify_write_nonfn(a, &new_name);
                     match kind {
                         WriteKind::FirstDecl | WriteKind::Shadow => {
                             stmts.push(Stat::Local {
@@ -4506,6 +4508,13 @@ pub(super) fn lift_instruction_range(
                     compose_guard_chain(code, regs, pc, end)
                 {
                     let snap = regs.clone();
+                    // Same rule as the or-chain below: the arm's statements
+                    // are only kept when the push succeeds, so on the reject
+                    // path the declaration bookkeeping must be rolled back
+                    // with the registers. Without this, a guard chain that
+                    // was tried and abandoned still marked its registers
+                    // declared, and the real lift emitted bare assignments.
+                    let snap_locals = locals.clone();
                     let mut then_stmts = Vec::new();
                     lift_instruction_range(
                         ctx, proto, proto_index, depth + 1, body, exit_pc,
@@ -4513,6 +4522,9 @@ pub(super) fn lift_instruction_range(
                     );
                     regs.clear();
                     regs.extend_from_slice(&snap);
+                    if then_stmts.is_empty() {
+                        *locals = snap_locals;
+                    }
                     if !then_stmts.is_empty() {
                         stmts.push(Stat::If {
                             condition: chain_cond,
@@ -4592,9 +4604,18 @@ pub(super) fn lift_instruction_range(
                     // then correctly refuses a nil receiver and mints `v3`, so
                     // the output calls a method on nothing.
                     //
-                    // Snapshot and restore on the reject path only; the accept
-                    // path deliberately keeps its writes.
+                    // Snapshot `locals` as well as `regs`. The segment
+                    // statements built below are DISCARDED on both paths -
+                    // the accepted path folds them into one expression - so
+                    // any `Stat::Local` inside them must not leave a
+                    // declaration behind. It did: `locals.declared` is
+                    // proto-wide and was never rolled back, so a register
+                    // speculatively declared here counted as already-declared
+                    // afterwards and every later write to it emitted a bare
+                    // `x = ...` instead of `local x = ...`. Those bare writes
+                    // are what `free_var_decls` then hoists to chunk top.
                     let chain_snapshot = regs.clone();
+                    let chain_locals_snapshot = locals.clone();
                     let mut acc = reg_expr(regs, chain.dest);
                     let mut ok = true;
                     for &(seg_start, seg_end) in &chain.segments {
@@ -4649,6 +4670,7 @@ pub(super) fn lift_instruction_range(
                     //     17-line table constructor.
                     regs.clear();
                     regs.extend_from_slice(&chain_snapshot);
+                    *locals = chain_locals_snapshot;
                 }
 
                 // A jump that reaches the END of the enclosing loop leaves it,
@@ -5333,6 +5355,7 @@ pub(super) fn lift_instruction_range(
                     let any_new = (0..names.len()).any(|i| !locals.declared.contains(&(a + i)));
                     if any_new {
                         for i in 0..names.len() {
+                            LocalTracker::pre_declare_trace(proto, a + i, pc, "vararg-top");
                             locals.pre_declare(a + i);
                             // Phase B0.49: keep current_names in sync so future
                             // single-reg writes to these regs can shadow on
@@ -5477,6 +5500,7 @@ pub(super) fn lift_instruction_range(
                     let any_new = (0..names.len()).any(|i| !locals.declared.contains(&(a + i)));
                     if any_new {
                         for i in 0..names.len() {
+                            LocalTracker::pre_declare_trace(proto, a + i, pc, "vararg-bottom");
                             locals.pre_declare(a + i);
                             locals.record_name(a + i, &names[i]);
                         }

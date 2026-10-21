@@ -22,7 +22,7 @@ use table_reconstruction::{
     is_valid_luau_identifier,
 };
 
-mod post_passes;
+pub(crate) mod post_passes;
 use post_passes::{
     collapse_elseif_chains,
     collapse_nil_init_conditional,
@@ -2431,6 +2431,28 @@ fn fold_register_paths(paths: &[ValuePath], values: &[Expr]) -> Option<Expr> {
 /// register file. Returns `None` if any path emits a statement (the region is
 /// then not a pure value selection after all) or if the caps are exceeded.
 #[allow(clippy::too_many_arguments)]
+
+/// LUAU_VJ_TRACE reports why a value-join walk gave up, per proto.
+///
+/// `lift_value_join` has two fallbacks: a sound statement-chain lowering, and
+/// below that a plain linear lift of the whole span. The linear lift is what
+/// produces `if c then X = {} end` with X unbound, so when a join that WAS
+/// recognised (`VJ 0..9` in REGIONDUMP) still renders as an inline if, the
+/// question is which gate rejected it. Without this the answer had to be
+/// guessed from the output.
+fn vj_bail(proto: &Proto, entry: usize, join: usize, why: &str) {
+    if std::env::var("LUAU_VJ_TRACE").is_ok() {
+        eprintln!(
+            "VJBAIL\t{}@{}\tentry={}\tjoin={}\t{}",
+            proto.debug_name.as_deref().unwrap_or("?"),
+            proto.line_defined,
+            entry,
+            join,
+            why
+        );
+    }
+}
+
 fn enumerate_value_paths(
     ctx: &mut DecompileContext,
     proto: &Proto,
@@ -2454,15 +2476,24 @@ fn enumerate_value_paths(
     while let Some((block_id, cond, mut regs)) = stack.pop() {
         if block_id == join {
             if out.len() >= MAX_VALUE_JOIN_PATHS {
+                vj_bail(proto, entry, join, "too_many_paths");
                 return None;
             }
             out.push(ValuePath { condition: cond, regs });
             continue;
         }
         if !members.contains(&block_id) {
+            if std::env::var("LUAU_VJ_TRACE").is_ok() {
+                eprintln!("VJBAIL\t{}@{}\tentry={}\tjoin={}\tnot_member block={} members={:?}",
+                    proto.debug_name.as_deref().unwrap_or("?"), proto.line_defined,
+                    entry, join, block_id, members);
+            }
             return None;
         }
-        let block = cfg.blocks.get(&block_id)?;
+        let Some(block) = cfg.blocks.get(&block_id) else {
+            vj_bail(proto, entry, join, "no_block");
+            return None;
+        };
         let (body_end, terminator) = block_body_and_terminator(proto, block.start, block.end);
         // The entry block's pre-branch code has already been lifted into the
         // real statement list; only its branch belongs to the path walk.
@@ -2503,6 +2534,12 @@ fn enumerate_value_paths(
                     _ => false,
                 });
                 if !all_pure_temps {
+                    if std::env::var("LUAU_VJ_TRACE").is_ok() {
+                        eprintln!("VJBAIL\t{}@{}\tentry={}\tjoin={}\tside_effect block={} stmts={:?}",
+                            proto.debug_name.as_deref().unwrap_or("?"), proto.line_defined,
+                            entry, join, block_id,
+                            scratch.iter().map(|s| format!("{:?}", s).chars().take(90).collect::<String>()).collect::<Vec<_>>());
+                    }
                     return None;
                 }
                 hoist.extend(scratch.drain(..));
@@ -2512,7 +2549,10 @@ fn enumerate_value_paths(
         match block.successors.len() {
             1 => stack.push((block.successors[0], cond, regs)),
             2 => {
-                let branch_pc = terminator?;
+                let Some(branch_pc) = terminator else {
+                vj_bail(proto, entry, join, "no_terminator");
+                return None;
+            };
                 let fall_cond = extract_branch_condition(ctx, proto, branch_pc, &regs);
                 // Pushed in reverse so the fall-through edge is popped first.
                 stack.push((
@@ -2657,6 +2697,16 @@ fn lift_value_join(
         // Not a pure value selection after all. Fall back to the linear lift of
         // the whole span, which is exactly what a `Region::Linear` would do.
         _ => {
+            if std::env::var("LUAU_VJ_TRACE").is_ok() {
+                eprintln!(
+                    "VJBAIL\t{}@{}\tentry={}\tjoin={}\ttoo_few_paths paths={:?}",
+                    proto.debug_name.as_deref().unwrap_or("?"),
+                    proto.line_defined,
+                    entry,
+                    join,
+                    paths.as_ref().map(|p| p.len())
+                );
+            }
             // Seed the registers that escape this diamond BEFORE the fallback
             // lift, exactly as the `Region::IfThenElse` caller does.
             //
@@ -3013,6 +3063,16 @@ fn lift_region(
             // Snapshot register state before branches so then/else don't
             // corrupt each other's view of the registers.
             let regs_before = regs.clone();
+            // AN ARM'S `local` DIES AT THE ARM'S `end`.
+            //
+            // `locals` is proto-wide bookkeeping, but the statements it
+            // describes are emitted INSIDE an if-block. Without restoring it,
+            // a `local X` declared in one arm counts as declared for the whole
+            // rest of the proto, so a later write to that register classifies
+            // as `Reassign` and emits a bare `X = ...` — a global write where
+            // the source had a fresh local. Those bare writes are exactly what
+            // `free_var_decls` hoists to chunk top (858 names on one chunk).
+            let locals_before_arms = locals.clone();
 
             // Lift then-body (sorted by start PC for correct instruction order)
             let mut then_sorted = then_region.clone();
@@ -3024,6 +3084,7 @@ fn lift_region(
             // Restore pre-branch state for the else-branch. Clone so we can
             // still reference `regs_before` afterward in the B0.57 hoist.
             *regs = regs_before.clone();
+            *locals = locals_before_arms.clone();
 
             // Lift else-body (sorted by start PC for correct instruction order)
             let mut else_sorted = else_region.clone();
@@ -3698,6 +3759,7 @@ fn lift_region(
             // `local v8 = 1 * 1`.
             if (a + 2) < regs.len() {
                 regs[a + 2] = RegVal::Expr(Expr::Name(var_name.clone()));
+                LocalTracker::pre_declare_trace(proto, a + 2, *prep_pc, "genericfor-var");
                 locals.pre_declare(a + 2);
                 // Phase B0.49: record the loop-var name so body writes to
                 // this register treat the loop variable as the existing
@@ -3932,6 +3994,7 @@ fn lift_region(
                 for name in &var_names {
                     if reg < regs.len() {
                         regs[reg] = RegVal::LoopVar(name.clone());
+                        LocalTracker::pre_declare_trace(proto, reg, *prep_pc, "numericfor-var");
                         locals.pre_declare(reg);
                         // Phase B0.49: keep current_names in sync with loop
                         // variable bindings so body writes correctly classify.
@@ -5101,6 +5164,16 @@ pub(super) fn store_complex(
     // (only fires when the destination is already a named local AND the new
     // value reads from it) and safe (fold-only patterns like `R2 = R0 + 1`
     // are unaffected because `value` doesn't reference `R2`).
+    if std::env::var("LUAU_WRITE_TRACE").is_ok() {
+        eprintln!(
+            "WRITE\tpass={}\t{}@{}\treg={}\tpc={}",
+            next_pass_id(),
+            proto.debug_name.as_deref().unwrap_or("?"),
+            proto.line_defined,
+            reg,
+            pc
+        );
+    }
     let is_self_mutation = match regs.get(reg) {
         Some(RegVal::Expr(Expr::Name(n))) | Some(RegVal::LoopVar(n)) => {
             expr_references_name(&value, n)
@@ -5331,7 +5404,12 @@ pub(super) fn store_complex(
                 // a semantic rebind.  `classify_write` returns Shadow or
                 // Reassign depending on `current_names` state; either way
                 // the emitted code uses the new name.
-                let (kind, final_name) = locals.classify_write(reg, &new_name);
+                let (kind, final_name) = locals.classify_write_ex(reg, &new_name, &value);
+                if std::env::var("LUAU_WRITE_TRACE").is_ok() {
+                    eprintln!("KIND\tpass={}\t{}@{}\treg={}\tpc={}\t{:?}\t{}",
+                        next_pass_id(), proto.debug_name.as_deref().unwrap_or("?"),
+                        proto.line_defined, reg, pc, kind, final_name);
+                }
                 match kind {
                     WriteKind::FirstDecl | WriteKind::Shadow => {
                         stmts.push(Stat::Local {
@@ -5361,6 +5439,16 @@ pub(super) fn store_complex(
                 // Keep current name to avoid clobbering the self-mutation
                 // pattern (see Phase B0.3 comment above).  Do not overwrite
                 // current_names here — the existing binding stands.
+                if std::env::var("LUAU_BARE_TRACE").is_ok() && !locals.is_non_param(reg) == false {
+                    eprintln!(
+                        "BARE\t{}@{}\treg={}\tpc={}\tname={}",
+                        proto.debug_name.as_deref().unwrap_or("?"),
+                        proto.line_defined,
+                        reg,
+                        pc,
+                        name
+                    );
+                }
                 stmts.push(Stat::Assign {
                     targets: vec![Expr::Name(name.clone())],
                     values: vec![value],
@@ -5374,7 +5462,12 @@ pub(super) fn store_complex(
             if new_name == "self" && matches!(&value, Expr::Function { .. }) {
                 new_name = format!("fn{}", reg);
             }
-            let (kind, name) = locals.classify_write(reg, &new_name);
+            let (kind, name) = locals.classify_write_ex(reg, &new_name, &value);
+            if std::env::var("LUAU_WRITE_TRACE").is_ok() {
+                eprintln!("KIND\tpass={}\t{}@{}\treg={}\tpc={}\t{:?}\t{}",
+                    next_pass_id(), proto.debug_name.as_deref().unwrap_or("?"),
+                    proto.line_defined, reg, pc, kind, name);
+            }
             match kind {
                 WriteKind::FirstDecl | WriteKind::Shadow => {
                     stmts.push(Stat::Local {
