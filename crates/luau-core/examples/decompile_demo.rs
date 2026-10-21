@@ -22,6 +22,7 @@
 //! ```
 
 use luau_core::decompiler::{decompile_proto, DecompileContext};
+use luau_core::parser::opcodes::LuauOpcode;
 use luau_core::parser::types::{Chunk, Constant, Proto};
 
 // Canonical Luau opcode bytes (mirror `LuauOpcode as u8`).
